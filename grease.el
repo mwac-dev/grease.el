@@ -10,6 +10,7 @@
 ;; - Create a file by adding a new line (`o`, `O`). End with "/" for a directory.
 ;; - Copy/paste lines to copy files (`yy`, `p`).
 ;; - Cut/paste lines to move files (`dd`, `p`).
+;; - Use visual mode to select and edit multiple lines at once.
 ;;
 ;; Changes are staged until you save with `grease-save` (C-c C-s), or when
 ;; prompted before actions like visiting a file (`RET`) or quitting (`q`).
@@ -33,22 +34,24 @@
 (defvar-local grease--buffer-dirty-p nil)
 (defvar-local grease--change-hook-active nil)
 (defvar grease--global-clipboard nil
-  "Global clipboard for cross-directory operations. Contains :action :path :names :types.")
+  "Global clipboard for cross-directory operations.")
 (defvar-local grease--global-changes nil
   "List of changes across directory navigation.")
 
 ;;;; Core Helpers
 
 (defun grease--is-dir-name (name)
+  "Check if NAME represents a directory (ends with '/')."
   (and name (string-suffix-p "/" name)))
 
 (defun grease--strip-trailing-slash (name)
+  "Remove trailing slash from NAME if present."
   (if (grease--is-dir-name name)
       (substring name 0 -1)
     name))
 
 (defun grease--normalize-name (name type)
-  "Normalize a name based on its type, ensuring directories have trailing slashes."
+  "Normalize NAME based on TYPE, ensuring directories have trailing slashes."
   (if (eq type 'dir)
       (if (grease--is-dir-name name) name (concat name "/"))
     (grease--strip-trailing-slash name)))
@@ -59,20 +62,20 @@
            (grease--normalize-name name2 type2)))
 
 (defun grease--get-icon (name)
+  "Get appropriate icon for NAME."
   (if grease--have-icons
       (if (grease--is-dir-name name)
           (nerd-icons-icon-for-dir name)
         (nerd-icons-icon-for-file name))
     (if (grease--is-dir-name name) "📁" "📄")))
 
-(defun grease--extract-clean-filename (line-text)
-  "Extract just the filename portion from a line of text, removing icons and spaces."
-  (when (string-match "\\(?:[📁📄]\\|\\S-+\\)\\s-+\\(.*\\)" line-text)
+(defun grease--parse-line (line-text)
+  "Extract filename and metadata from LINE-TEXT."
+  (when (string-match "^\\(?:[📁📄]\\|\\S-+\\)\\s-+\\(.*\\)$" line-text)
     (match-string 1 line-text)))
 
 (defun grease--get-line-info ()
-  "Return a plist of the current line's info.
-Includes :original-name, :current-name, and the editable :region (cons BEG . END)."
+  "Return information about the current line."
   (let* ((bol (line-beginning-position))
          (eol (line-end-position))
          (line-text (buffer-substring-no-properties bol eol)))
@@ -109,8 +112,7 @@ Includes :original-name, :current-name, and the editable :region (cons BEG . END
 ;;;; Buffer Rendering and Management
 
 (defun grease--insert-entry (filename type &optional original-name copy-id is-duplicate source-name)
-  "Insert a formatted line with read-only icon and editable filename.
-ORIGINAL-NAME defaults to FILENAME."
+  "Insert a formatted line with icon and filename."
   (let* ((original-name (or original-name filename))
          (is-dir (eq type 'dir))
          (display-name (if is-dir (concat filename "/") filename))
@@ -119,8 +121,8 @@ ORIGINAL-NAME defaults to FILENAME."
     (let ((icon-start (point)))
       (insert icon " ")
       (add-text-properties icon-start (point) 
-                          '(read-only t rear-nonsticky t front-sticky nil)))
-    ;; Insert filename with editable properties
+                           '(read-only t rear-nonsticky t front-sticky nil)))
+    ;; Insert filename with metadata properties but allow editing
     (let ((name-start (point)))
       (insert display-name)
       (put-text-property name-start (point) 'grease-original-name original-name)
@@ -135,8 +137,7 @@ ORIGINAL-NAME defaults to FILENAME."
     (insert "\n")))
 
 (defun grease--render (dir &optional keep-changes)
-  "Render the contents of DIR into the current buffer from scratch.
-If KEEP-CHANGES is non-nil, don't reset the global changes list."
+  "Render the contents of DIR into the current buffer."
   (let ((inhibit-read-only t)
         (inhibit-modification-hooks t)) ; Prevent hooks while we are building
     (erase-buffer)
@@ -149,7 +150,7 @@ If KEEP-CHANGES is non-nil, don't reset the global changes list."
     (let ((header-start (point)))
       (insert (format " Greasy Fork — %s\n" grease--root-dir))
       (add-text-properties header-start (point) 
-                          '(read-only t front-sticky nil face mode-line-inactive)))
+                           '(read-only t front-sticky nil face mode-line-inactive)))
     ;; Insert files
     (let* ((all-files (directory-files grease--root-dir nil nil t))
            (files (cl-remove-if (lambda (f) (member f '("." ".."))) all-files)))
@@ -161,10 +162,10 @@ If KEEP-CHANGES is non-nil, don't reset the global changes list."
     (goto-char (point-min))
     (forward-line 1)))
 
-;;;; Evil Integration
+;;;; Minimal Evil Integration
 
 (defun grease--evil-advice-for-dd (orig-fun beg end &rest args)
-  "Advice function to make `evil-delete-line` work with read-only text properties."
+  "Allow `evil-delete-line` to work with read-only icons."
   (if (and (derived-mode-p 'grease-mode)
            (not (= (line-number-at-pos beg) 1))) ; Skip header line
       ;; In grease mode, handle specially
@@ -173,7 +174,7 @@ If KEEP-CHANGES is non-nil, don't reset the global changes list."
     ;; Not in grease mode, use original function
     (apply orig-fun beg end args)))
 
-;; Apply our advice to evil-delete-line to handle read-only properties
+;; Apply advice to handle read-only properties
 (when (fboundp 'evil-delete-line)
   (advice-add 'evil-delete-line :around #'grease--evil-advice-for-dd))
 
@@ -185,88 +186,20 @@ If KEEP-CHANGES is non-nil, don't reset the global changes list."
                                       (grease-save)
                                     (call-interactively #'evil-write)))))
 
-;;;; Clipboard Operations
-
-(defun grease-copy-line ()
-  "Copy the current line to the grease clipboard."
-  (interactive)
-  (let* ((info (grease--get-line-info))
-         (name (plist-get info :current-name))
-         (type (or (plist-get info :file-type)
-                  (get-text-property (point) 'grease-file-type)
-                  (if (grease--is-dir-name name) 'dir 'file))))
-    (when info
-      (setq grease--global-clipboard 
-            (list :action 'copy
-                  :path grease--root-dir
-                  :names (list name)
-                  :types (list type)
-                  :copy-ids (list (or (plist-get info :copy-id)
-                                      (format "%s:%s" (or (plist-get info :original-name) name) (random))))))
-      (message "Copied: %s" name))))
-
-(defun grease-cut-line ()
-  "Cut the current line to the grease clipboard."
-  (interactive)
-  (let* ((info (grease--get-line-info))
-         (name (plist-get info :current-name))
-         (type (or (plist-get info :file-type)
-                  (get-text-property (point) 'grease-file-type)
-                  (if (grease--is-dir-name name) 'dir 'file))))
-    (when info
-      (setq grease--global-clipboard 
-            (list :action 'cut
-                  :path grease--root-dir
-                  :names (list name)
-                  :types (list type)
-                  :copy-ids (list (or (plist-get info :copy-id)
-                                      (format "%s:%s" (or (plist-get info :original-name) name) (random))))))
-      (let ((inhibit-read-only t))
-        (kill-whole-line))
-      (message "Cut: %s" name))))
-
-(defun grease-paste ()
-  "Paste from the grease clipboard.
-Always creates a new line first to ensure proper handling of pastes."
-  (interactive)
-  (when grease--global-clipboard
-    (let* ((action (plist-get grease--global-clipboard :action))
-           (source-path (plist-get grease--global-clipboard :path))
-           (names (plist-get grease--global-clipboard :names))
-           (types (plist-get grease--global-clipboard :types))
-           (copy-ids (plist-get grease--global-clipboard :copy-ids))
-           (inhibit-read-only t))
-      
-      ;; Go to end of line and create a new line
-      (end-of-line)
-      (insert "\n")
-      (forward-line -1)
-      
-      ;; Paste all items from clipboard
-      (dolist (i (number-sequence 0 (1- (length names))))
-        (let* ((name (nth i names))
-               (type (nth i types))
-               (copy-id (nth i copy-ids))
-               (is-copy (eq action 'copy))
-               (source-name (when is-copy name)))
-          (grease--insert-entry name type nil copy-id is-copy source-name)))
-      
-      ;; Position cursor on the first pasted line
-      (forward-line (- (length names)))
-      (message "Pasted %d item(s)" (length names)))))
+;;;; File Operation Helpers
 
 (defun grease-duplicate-line ()
-  "Duplicate the current line with a unique copy ID."
+  "Duplicate the current line with unique metadata."
   (interactive)
   (let* ((info (grease--get-line-info))
          (name (plist-get info :current-name))
          (type (or (plist-get info :file-type)
-                  (get-text-property (point) 'grease-file-type)
-                  (if (grease--is-dir-name name) 'dir 'file)))
+                   (get-text-property (point) 'grease-file-type)
+                   (if (grease--is-dir-name name) 'dir 'file)))
          (copy-id (format "%s:%s" (or (plist-get info :original-name) name) (random))))
     (when info
       (let ((inhibit-read-only t))
-        ;; Always create a new line first
+        ;; Create a new line
         (end-of-line)
         (insert "\n")
         ;; Insert duplicate with proper properties
@@ -278,6 +211,7 @@ Always creates a new line first to ensure proper handling of pastes."
 ;;;; Change Calculation (Diff Engine)
 
 (defun grease--format-change (change)
+  "Format CHANGE for display in confirmation prompt."
   (pcase change
     (`(:create ,name) (format "  [Create] %s" name))
     (`(:delete ,name) (format "  [Delete] %s" name))
@@ -304,7 +238,7 @@ Always creates a new line first to ensure proper handling of pastes."
       (push modified-change grease--global-changes))))
 
 (defun grease--collect-current-state ()
-  "Collect all current files in the buffer including their metadata."
+  "Collect all file entries in the buffer including metadata."
   (let ((files '()))
     (save-excursion
       (goto-char (point-min))
@@ -317,7 +251,7 @@ Always creates a new line first to ensure proper handling of pastes."
     files))
 
 (defun grease--detect-name-conflicts (files)
-  "Check for duplicate filenames in the list of file infos."
+  "Check for duplicate filenames in FILES."
   (let ((names (make-hash-table :test 'equal))
         (conflicts '()))
     (dolist (info files)
@@ -401,7 +335,7 @@ Always creates a new line first to ensure proper handling of pastes."
                 ;; Copy/paste is a copy operation
                 (push `(:copy ,full-source ,full-dest) changes)))))))
     
-    ;; Sort changes for consistent application order - deletions first, then copies, then renames, then creates
+    ;; Sort changes for consistent application order
     (sort changes
           (lambda (a b)
             (let ((type-a (car a))
@@ -423,7 +357,7 @@ Always creates a new line first to ensure proper handling of pastes."
                (t (string< (symbol-name type-a) (symbol-name type-b)))))))))
 
 (defun grease--apply-changes (changes)
-  "Apply the calculated changes to the filesystem."
+  "Apply CHANGES to the filesystem."
   (let ((errors '()))
     (dolist (change changes)
       (pcase change
@@ -479,10 +413,10 @@ Always creates a new line first to ensure proper handling of pastes."
         (warn "Grease: Encountered errors:\n%s" (mapconcat #'identity errors "\n"))
       (message "Grease: All changes applied successfully."))))
 
-;;;; User Commands (Actions, not Edits)
+;;;; User Commands
 
 (defun grease-save ()
-  "Calculate and apply changes in the current buffer."
+  "Save changes to the filesystem."
   (interactive)
   (let ((changes (grease--calculate-changes)))
     (if (not changes) 
@@ -497,7 +431,7 @@ Always creates a new line first to ensure proper handling of pastes."
         (message "Grease: Save cancelled.") nil))))
 
 (defun grease--with-commit-prompt (action-fn)
-  "Run ACTION-FN, prompting to save changes if buffer is dirty."
+  "Run ACTION-FN after saving if buffer is dirty."
   (if (not grease--buffer-dirty-p) (funcall action-fn)
     (let ((result (grease-save)))
       (when result (funcall action-fn)))))
@@ -509,7 +443,6 @@ Always creates a new line first to ensure proper handling of pastes."
          (name (plist-get info :current-name)))
     (if (not name) 
         (user-error "Not on a file or directory line.")
-      ;; Ensure we're getting just the filename without any icons
       (let* ((clean-name (string-trim name))
              (path (expand-file-name (grease--strip-trailing-slash clean-name) grease--root-dir)))
         (if (grease--is-dir-name clean-name)
@@ -520,7 +453,7 @@ Always creates a new line first to ensure proper handling of pastes."
                   (when changes
                     (grease--add-to-global-changes changes grease--root-dir))))
               (grease--render path t)) ; Keep global changes
-          ;; For files, we still want to prompt for commit
+          ;; For files, prompt to save first
           (grease--with-commit-prompt
            (lambda () 
              (kill-buffer (current-buffer)) 
@@ -617,17 +550,13 @@ Always creates a new line first to ensure proper handling of pastes."
   (add-hook 'after-change-functions #'grease--on-change nil t)
   (add-hook 'post-command-hook #'grease--after-change-hook nil t))
 
-;; Set up Evil mode keybindings properly
+;; Set up minimal Evil keybindings - only for special functions
 (when (fboundp 'evil-define-key*)
   (evil-define-key* 'normal grease-mode-map
     (kbd "RET") #'grease-visit
     (kbd "-") #'grease-up-directory  
     (kbd "g r") #'grease-refresh
-    (kbd "q") #'grease-quit
-    (kbd "y y") #'grease-copy-line
-    (kbd "d d") #'grease-cut-line
-    (kbd "p") #'grease-paste
-    (kbd "y p") #'grease-duplicate-line))
+    (kbd "q") #'grease-quit))
 
 ;;;; Entry Points
 
@@ -641,7 +570,7 @@ Always creates a new line first to ensure proper handling of pastes."
     (with-current-buffer buf
       (grease-mode)
       (grease--render dir))
-    (switch-to-buffer buf))) ; Use switch-to-buffer instead of pop-to-buffer
+    (switch-to-buffer buf)))
 
 ;;;###autoload
 (defun grease-toggle ()
