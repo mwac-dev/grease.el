@@ -213,6 +213,13 @@ This is a critical function for proper filename handling."
           (grease--insert-entry next-id file type file)
           (setq next-id (1+ next-id)))))
     
+    ;; Add a blank line after the last file to make it easier to add new files
+    ;; This is especially important for empty directories
+    (let ((start (point)))
+      (insert "\n")
+      ;; Make this line editable even in empty directories
+      (put-text-property start (point) 'grease-editable t))
+    
     (goto-char (point-min))
     (forward-line 1)))
 
@@ -251,14 +258,21 @@ This is a critical function for proper filename handling."
          (line-beg (save-excursion 
                      (goto-char pos)
                      (line-beginning-position))))
-    (when (and (> (line-number-at-pos pos) 1)  ; Skip header
-               (get-text-property line-beg 'grease-name))
-      (list :name (get-text-property line-beg 'grease-name)
-            :type (get-text-property line-beg 'grease-type)
-            :original-name (get-text-property line-beg 'grease-original-name)
-            :is-duplicate (get-text-property line-beg 'grease-is-duplicate)
-            :source-name (get-text-property line-beg 'grease-source-name)
-            :id (get-text-property line-beg 'grease-id)))))
+    (when (> (line-number-at-pos pos) 1)  ; Skip header
+      (if (get-text-property line-beg 'grease-name)
+          (list :name (get-text-property line-beg 'grease-name)
+                :type (get-text-property line-beg 'grease-type)
+                :original-name (get-text-property line-beg 'grease-original-name)
+                :is-duplicate (get-text-property line-beg 'grease-is-duplicate)
+                :source-name (get-text-property line-beg 'grease-source-name)
+                :id (get-text-property line-beg 'grease-id))
+        ;; For plain text lines without properties
+        (let* ((line-text (buffer-substring-no-properties line-beg (line-end-position)))
+               (filename (string-trim line-text)))
+          (when (not (string-empty-p filename))
+            (list :name (grease--strip-trailing-slash filename)
+                  :type (if (grease--is-dir-name filename) 'dir 'file)
+                  :is-new t)))))))
 
 ;; Evil integration hooks
 (defun grease--on-evil-yank (beg end &rest _)
@@ -467,14 +481,50 @@ This is a critical function for proper filename handling."
                    (type (if is-dir 'dir 'file)))
               
               ;; Update text properties with new name
-              (put-text-property line-beg line-end 'grease-name name)
-              (put-text-property line-beg line-end 'grease-type type))))
+              (when (get-text-property line-beg 'grease-name)
+                (put-text-property line-beg line-end 'grease-name name)
+                (put-text-property line-beg line-end 'grease-type type)))))
         
         (forward-line 1)))))
 
+(defun grease--format-plain-lines ()
+  "Format any plain text lines into properly structured entries."
+  (save-excursion
+    (goto-char (point-min))
+    (forward-line 1) ; Skip header
+    (while (not (eobp))
+      (let* ((line-beg (line-beginning-position))
+             (line-end (line-end-position))
+             (has-grease-props (get-text-property line-beg 'grease-name)))
+        
+        ;; Only process non-empty lines without our metadata
+        (unless (or has-grease-props 
+                    (string-empty-p (string-trim (buffer-substring-no-properties
+                                                  line-beg line-end))))
+          (let* ((line-text (buffer-substring-no-properties line-beg line-end))
+                 (file-name (string-trim line-text)))
+            
+            (when (not (string-empty-p file-name))
+              (let* ((is-dir (grease--is-dir-name file-name))
+                     (type (if is-dir 'dir 'file))
+                     (next-id (grease--get-next-id)))
+                
+                ;; Delete the line content and insert properly formatted entry
+                (delete-region line-beg line-end)
+                (goto-char line-beg)
+                (grease--insert-entry next-id 
+                                     (grease--strip-trailing-slash file-name)
+                                     type)
+                (setq grease--buffer-dirty-p t)))))
+      
+      (forward-line 1)))))
+
 (defun grease--scan-buffer ()
   "Scan buffer and update file tracking data."
-  ;; First update line metadata based on current text
+  ;; First ensure all plain text lines are properly formatted
+  (grease--format-plain-lines)
+  
+  ;; Now update metadata for all lines
   (grease--update-line-metadata)
   
   (let ((entries '())
@@ -489,7 +539,7 @@ This is a critical function for proper filename handling."
         (let* ((line-beg (line-beginning-position))
                (line-data (grease--get-line-data (point))))
           
-          ;; Process the line if it has our file metadata
+          ;; Process the line if it has file data
           (when line-data
             (let* ((name (plist-get line-data :name))
                    (type (plist-get line-data :type))
@@ -497,12 +547,14 @@ This is a critical function for proper filename handling."
                    (is-duplicate (plist-get line-data :is-duplicate))
                    (source-name (plist-get line-data :source-name))
                    (id (plist-get line-data :id))
+                   (is-new (plist-get line-data :is-new))
                    (data (list :name name
                                :type type
                                :id id
                                :original-name original-name
                                :is-duplicate is-duplicate
-                               :source-name source-name)))
+                               :source-name source-name
+                               :is-new is-new)))
               
               (push data entries)
               ;; Track by name for duplicate detection
@@ -613,7 +665,8 @@ This is a critical function for proper filename handling."
             (current (plist-get entry :name))
             (type (plist-get entry :type))
             (is-duplicate (plist-get entry :is-duplicate))
-            (source-name (plist-get entry :source-name)))
+            (source-name (plist-get entry :source-name))
+            (is-new (plist-get entry :is-new)))
         
         (cond
          ;; Case 1: A duplicated line, which is a copy.
@@ -629,7 +682,11 @@ This is a critical function for proper filename handling."
           (when source-name
             (puthash (grease--strip-trailing-slash source-name) t seen-originals)))
          
-         ;; Case 2: An existing file that was not duplicated.
+         ;; Case 2: A newly created file (with no formatting yet)
+         (is-new
+          (push `(:create ,(grease--get-full-path current)) changes))
+         
+         ;; Case 3: An existing file that was not duplicated.
          ((and original (gethash original original-files))
           (puthash original t seen-originals)
           ;; Check for rename.
@@ -638,11 +695,11 @@ This is a critical function for proper filename handling."
                     ,(grease--get-full-path current)) 
                   changes)))
          
-         ;; Case 3: New file, created from scratch.
+         ;; Case 4: New file, created from scratch.
          (t
           (push `(:create ,(grease--get-full-path current)) changes)))))
     
-    ;; Case 4: Any original file not seen in the current buffer was deleted.
+    ;; Case 5: Any original file not seen in the current buffer was deleted.
     (maphash (lambda (name type)
                (unless (gethash name seen-originals)
                  (push `(:delete ,(grease--get-full-path name)) changes)))
