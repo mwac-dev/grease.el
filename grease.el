@@ -67,6 +67,10 @@ Each entry is keyed by unique ID and contains:
 (defvar grease--multi-line-selection nil
   "Data about currently selected files in visual mode.")
 
+;; Store multi-line selection data during deletion operations
+(defvar grease--deleted-selection nil
+  "Store multi-line selection data during deletion operations.")
+
 ;;;; Buffer-Local State
 
 (defvar-local grease--root-dir nil
@@ -471,17 +475,24 @@ IS-DUPLICATE indicates if this is a copy of another file."
         (let ((ids (plist-get grease--multi-line-selection :ids))
               (paths (plist-get grease--multi-line-selection :paths))
               (names (plist-get grease--multi-line-selection :names)))
+          ;; Save the multi-selection for after the delete completes
+          (setq grease--deleted-selection grease--multi-line-selection)
+          
+          ;; Store in clipboard
           (setq grease--clipboard 
                 (append grease--multi-line-selection
                         (list :operation 'move)))
+          
           ;; Mark files as deleted
           (cl-loop for id in ids
                    for path in paths
                    when id
                    do (grease--mark-file-deleted id path))
+          
           (message "Cut %d file%s" 
                    (length names) 
                    (if (= (length names) 1) "" "s")))
+      
       ;; Handle single line delete  
       (let ((data (grease--get-line-data)))
         (when data
@@ -503,6 +514,16 @@ IS-DUPLICATE indicates if this is a copy of another file."
               (grease--mark-file-deleted id path))
 
             (message "Cut file: %s" name)))))))
+
+(defun grease--after-evil-delete (&rest _)
+  "Handle operations after a delete action completes."
+  (when (and (derived-mode-p 'grease-mode) 
+             grease--deleted-selection)
+    ;; Restore the operation type to ensure paste works
+    (setq grease--last-op-type 'file)
+    (setq grease--last-kill-index 0)
+    ;; Clear the saved selection (but keep clipboard data)
+    (setq grease--deleted-selection nil)))
 
 ;; Track the last yanked text to handle paste properly
 (defvar grease--last-yanked-text nil
@@ -623,6 +644,13 @@ IS-DUPLICATE indicates if this is a copy of another file."
 
 (when (fboundp 'evil-delete)
   (advice-add 'evil-delete :before #'grease--before-evil-delete))
+
+;; Add after-delete hooks for multi-line operations
+(when (fboundp 'evil-delete-line)
+  (advice-add 'evil-delete-line :after #'grease--after-evil-delete))
+
+(when (fboundp 'evil-delete)
+  (advice-add 'evil-delete :after #'grease--after-evil-delete))
 
 ;; For regular Emacs operations that change the kill ring
 (advice-add 'kill-new :after
@@ -1166,6 +1194,10 @@ Returns a list of rename operations to be performed."
                      ;; Keep the same ID for moves
                      (grease--insert-entry id name type nil nil)))))
 
+      ;; Keep the clipboard data valid to allow multiple pastes
+      (setq grease--last-op-type 'file)
+      (setq grease--last-kill-index 0)
+      
       ;; Mark buffer as dirty
       (setq grease--buffer-dirty-p t)
       (message "%s %d file%s"
@@ -1260,10 +1292,11 @@ Returns a list of rename operations to be performed."
   (evil-define-key* 'normal grease-mode-map
     (kbd "RET") #'grease-visit
     (kbd "-") #'grease-up-directory
-    (kbd "g r") #'grease-refresh
-    (kbd "q") #'grease-quit
-    (kbd "y y") #'grease-copy
-    (kbd "d d") #'grease-cut))
+    (kbd "g r") #'grease-refresh)
+    ; (kbd "q") #'grease-quit
+    ; (kbd "y y") #'grease-copy
+    ; (kbd "d d") #'grease-cut)
+  )
 
 ;;;; Entry Points
 
