@@ -33,14 +33,33 @@
 
 ;;;; Buffer-Local State
 
-(defvar-local grease--root-dir nil)
-(defvar-local grease--original-state nil)
-(defvar-local grease--buffer-dirty-p nil)
-(defvar-local grease--change-hook-active nil)
+(defvar-local grease--root-dir nil
+  "Current directory being displayed.")
+
+(defvar-local grease--original-state nil
+  "Hash table of original filenames -> file types.")
+
+(defvar-local grease--buffer-dirty-p nil
+  "Non-nil if buffer has unsaved changes.")
+
+(defvar-local grease--change-hook-active nil
+  "Flag to prevent recursive change hooks.")
+
+(defvar-local grease--id-to-file nil
+  "Hash table mapping numeric IDs to file metadata.")
+
+(defvar-local grease--next-id 1
+  "Next available ID for file entries.")
+
 (defvar grease--global-clipboard nil
   "Global clipboard for cross-directory operations.")
+
 (defvar-local grease--global-changes nil
   "List of changes across directory navigation.")
+
+;; New tracking for duplicate sets
+(defvar-local grease--duplicate-sets nil
+  "Hash table tracking groups of duplicated files.")
 
 ;;;; Core Helpers
 
@@ -73,47 +92,55 @@
         (nerd-icons-icon-for-file name))
     (if (grease--is-dir-name name) "📁" "📄")))
 
+(defun grease--get-line-text (line-number)
+  "Get the text of LINE-NUMBER without properties."
+  (save-excursion
+    (goto-char (point-min))
+    (forward-line (1- line-number))
+    (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
+
 (defun grease--parse-line (line-text)
-  "Extract filename from LINE-TEXT, stripping potential icon prefix."
-  (if (string-match "^\\(?:[📁📄]\\|\\S-+\\)\\s-+\\(.*\\)$" line-text)
-      (match-string 1 line-text)
-    (string-trim line-text)))
+  "Parse LINE-TEXT into components.
+Returns a plist with :id and :name."
+  (if (string-match "^\\([0-9]+\\):\\s-*\\(.*\\)$" line-text)
+      (let* ((id-str (match-string 1 line-text))
+             (name (match-string 2 line-text))
+             (id (string-to-number id-str)))
+        (list :id id :name name))
+    ;; For lines without IDs (newly inserted)
+    (list :id nil :name (string-trim line-text))))
 
 (defun grease--get-line-info ()
   "Return information about the current line."
-  (let* ((bol (line-beginning-position))
-         (eol (line-end-position))
-         (line-text (buffer-substring-no-properties bol eol)))
-    
-    ;; Skip empty lines and the header
-    (unless (or (= (line-number-at-pos) 1) 
-                (string-match-p "^\\s-*$" (string-trim line-text)))
-      ;; --- CHANGE: Simplified parsing to handle with/without icons ---
-      (let* ((name-start (if grease--use-icons
-                             (or (next-single-property-change bol 'read-only nil eol) bol)
-                           bol))
-             (current-name (string-trim (buffer-substring-no-properties name-start eol)))
-             (original-name (get-text-property name-start 'grease-original-name))
-             (file-type (get-text-property name-start 'grease-file-type))
-             (is-duplicate (get-text-property name-start 'grease-is-duplicate))
-             (source-name (get-text-property name-start 'grease-source-name)))
-        
-        (list :original-name original-name
-              :current-name current-name
-              :file-type (or file-type (if (grease--is-dir-name current-name) 'dir 'file))
-              :is-duplicate is-duplicate
-              :source-name source-name)))))
+  (let* ((line-text (buffer-substring-no-properties 
+                    (line-beginning-position) (line-end-position)))
+         (parsed (grease--parse-line line-text)))
+    (when parsed
+      (let* ((id (plist-get parsed :id))
+             (metadata (when id (gethash id grease--id-to-file))))
+        (or metadata
+            (list :name (plist-get parsed :name)
+                  :type (if (grease--is-dir-name (plist-get parsed :name)) 'dir 'file)))))))
 
 ;;;; Buffer Rendering and Management
 
-(defun grease--insert-entry (filename type &optional original-name copy-id is-duplicate source-name)
-  "Insert a formatted line with filename and metadata."
-  (let* ((original-name (or original-name filename))
+(defun grease--insert-entry (id name type &optional original-name is-duplicate source-name duplicate-set)
+  "Insert a formatted line for file with ID, NAME and TYPE."
+  (let* ((original-name (or original-name name))
          (is-dir (eq type 'dir))
-         (display-name (if is-dir (concat filename "/") filename))
-         (start (point)))
+         (display-name (if is-dir (concat name "/") name))
+         (start (point))
+         (data (list :name name
+                     :original-name original-name
+                     :type type
+                     :is-duplicate (or is-duplicate nil)
+                     :source-name source-name
+                     :duplicate-set duplicate-set)))
     
-    ;; --- CHANGE: Conditionally insert icon ---
+    ;; Store in ID map
+    (puthash id data grease--id-to-file)
+    
+    ;; Insert the visible content
     (when grease--use-icons
       (let ((icon (grease--get-icon display-name)))
         (insert icon " ")
@@ -121,15 +148,7 @@
                              '(read-only t rear-nonsticky t front-sticky nil))
         (setq start (point))))
 
-    (insert display-name)
-    (put-text-property start (point) 'grease-original-name original-name)
-    (put-text-property start (point) 'grease-file-type type)
-    (when copy-id
-      (put-text-property start (point) 'grease-copy-id copy-id))
-    (when is-duplicate
-      (put-text-property start (point) 'grease-is-duplicate t))
-    (when source-name
-      (put-text-property start (point) 'grease-source-name source-name))
+    (insert (format "%d: %s" id display-name))
     (put-text-property start (point) 'face 'font-lock-function-name-face)
     (insert "\n")))
 
@@ -140,26 +159,125 @@
     (erase-buffer)
     (setq grease--root-dir (file-name-as-directory (expand-file-name dir)))
     (setq grease--original-state (make-hash-table :test 'equal))
+    (setq grease--id-to-file (make-hash-table :test 'eql))
+    (setq grease--duplicate-sets (make-hash-table :test 'equal))
+    (setq grease--next-id 1)
     (unless keep-changes
       (setq grease--global-changes nil))
     (setq grease--buffer-dirty-p nil)
+    
     ;; Insert header
     (let ((header-start (point)))
       (insert (format " Greasy Fork — %s\n" grease--root-dir))
       (add-text-properties header-start (point) 
                            '(read-only t front-sticky nil face mode-line-inactive)))
+    
     ;; Insert files
     (let* ((all-files (directory-files grease--root-dir nil nil t))
            (files (cl-remove-if (lambda (f) (member f '("." ".."))) all-files)))
       (dolist (file (sort files #'string<))
         (let* ((abs-path (expand-file-name file grease--root-dir))
-               (type (if (file-directory-p abs-path) 'dir 'file)))
+               (type (if (file-directory-p abs-path) 'dir 'file))
+               (id grease--next-id))
           (puthash file type grease--original-state)
-          (grease--insert-entry file type))))
+          (grease--insert-entry id file type)
+          (setq grease--next-id (1+ grease--next-id)))))
+    
     (goto-char (point-min))
     (forward-line 1)))
 
-;;;; Minimal Evil Integration
+;;;; Buffer Change Tracking
+
+(defun grease--add-to-duplicate-set (set-id id)
+  "Add ID to the duplicate SET-ID."
+  (let ((set (gethash set-id grease--duplicate-sets)))
+    (if set
+        (push id set)
+      (setq set (list id)))
+    (puthash set-id set grease--duplicate-sets)))
+
+(defun grease--scan-buffer ()
+  "Scan buffer and update file tracking data."
+  (let ((new-id-to-file (make-hash-table :test 'eql))
+        (names-to-ids (make-hash-table :test 'equal))
+        (new-duplicate-sets (make-hash-table :test 'equal)))
+    
+    ;; First pass: collect all entries
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line 1) ; Skip header
+      (while (not (eobp))
+        (let* ((line-text (buffer-substring-no-properties 
+                           (line-beginning-position) (line-end-position)))
+               (parsed (grease--parse-line line-text)))
+          (when parsed
+            (let* ((id (plist-get parsed :id))
+                   (name (plist-get parsed :name))
+                   (is-dir (grease--is-dir-name name))
+                   (name-clean (if is-dir (grease--strip-trailing-slash name) name))
+                   (type (if is-dir 'dir 'file))
+                   (existing (and id (gethash id grease--id-to-file)))
+                   (original-name (when existing (plist-get existing :original-name)))
+                   (is-duplicate (when existing (plist-get existing :is-duplicate)))
+                   (source-name (when existing (plist-get existing :source-name)))
+                   (duplicate-set (when existing (plist-get existing :duplicate-set))))
+              
+              ;; Track entries by name
+              (push id (gethash name-clean names-to-ids nil))
+              
+              ;; Store entry data
+              (when id  ; Only store entries with IDs
+                (puthash id 
+                        (list :name name-clean
+                              :original-name (or original-name name-clean)
+                              :type type
+                              :is-duplicate (or is-duplicate nil)
+                              :source-name source-name
+                              :duplicate-set duplicate-set)
+                        new-id-to-file)))))
+        (forward-line 1)))
+    
+    ;; Second pass: handle duplicates
+    (maphash (lambda (name ids)
+               (when (> (length ids) 1)
+                 ;; Create a set ID based on the name
+                 (let ((set-id (concat "dup-" name)))
+                   ;; Update all entries in this set
+                   (dolist (id ids)
+                     (let ((data (gethash id new-id-to-file)))
+                       (setf (plist-get data :duplicate-set) set-id)
+                       (puthash id data new-id-to-file))
+                     ;; Add to the duplicate set
+                     (push id (gethash set-id new-duplicate-sets nil))))))
+             names-to-ids)
+    
+    ;; Third pass: mark duplicates
+    (maphash (lambda (set-id ids)
+               (let ((ids-sorted (sort ids #'<))
+                     (original-id (car (last (sort (copy-sequence ids) #'<)))))
+                 ;; The last ID (highest number) is considered the original
+                 (dolist (id ids-sorted)
+                   (unless (= id original-id)
+                     (let* ((data (gethash id new-id-to-file))
+                            (orig-data (gethash original-id new-id-to-file)))
+                       (setf (plist-get data :is-duplicate) t
+                             (plist-get data :source-name) 
+                             (or (plist-get orig-data :original-name)
+                                 (plist-get orig-data :name)))
+                       (puthash id data new-id-to-file))))))
+             new-duplicate-sets)
+    
+    ;; Update the tracking data
+    (setq grease--id-to-file new-id-to-file)
+    (setq grease--duplicate-sets new-duplicate-sets)))
+
+(defun grease--on-change (_beg _end _len)
+  "Hook run after buffer changes to mark it dirty."
+  (unless grease--change-hook-active
+    (let ((grease--change-hook-active t))
+      (setq grease--buffer-dirty-p t))))
+
+;;;; Evil Integration
 
 (defun grease--evil-advice-for-dd (orig-fun beg end &rest args)
   "Allow `evil-delete-line` to work with read-only icons."
@@ -179,24 +297,80 @@
                                       (grease-save)
                                     (call-interactively #'evil-write)))))
 
+;; Add support for yanking/pasting with metadata
+(defun grease--advice-evil-paste (orig-fun &rest args)
+  "Advice to run after Evil paste commands."
+  (let ((result (apply orig-fun args)))
+    (when (derived-mode-p 'grease-mode)
+      (grease--scan-buffer))
+    result))
+
+;; Add advice to Evil paste commands
+(when (fboundp 'evil-paste-after)
+  (advice-add 'evil-paste-after :around #'grease--advice-evil-paste))
+(when (fboundp 'evil-paste-before)
+  (advice-add 'evil-paste-before :around #'grease--advice-evil-paste))
+
 ;;;; File Operation Helpers
 
 (defun grease-duplicate-line ()
   "Duplicate the current line with unique metadata."
   (interactive)
-  (let* ((info (grease--get-line-info))
-         (name (plist-get info :current-name))
-         (type (plist-get info :file-type))
-         ;; --- CHANGE: Use original-name from info for the copy ---
-         (original-name (plist-get info :original-name))
-         (copy-id (format "%s:%s" (or original-name name) (random))))
-    (when info
-      (end-of-line)
-      (insert "\n")
-      ;; --- CHANGE: Pass original-name, is-duplicate, and source-name correctly ---
-      (grease--insert-entry name type original-name copy-id t name)
-      (forward-line -1)
-      (message "Duplicated: %s" name))))
+  (let* ((line-text (buffer-substring-no-properties 
+                     (line-beginning-position) (line-end-position)))
+         (parsed (grease--parse-line line-text)))
+    
+    (when parsed
+      (let* ((id (plist-get parsed :id))
+             (orig-data (when id (gethash id grease--id-to-file)))
+             (name (if orig-data (plist-get orig-data :name) (plist-get parsed :name)))
+             (type (if orig-data (plist-get orig-data :type) 
+                     (if (grease--is-dir-name (plist-get parsed :name)) 'dir 'file)))
+             (original-name (when orig-data (plist-get orig-data :original-name)))
+             (new-id grease--next-id)
+             (duplicate-set (or (when orig-data (plist-get orig-data :duplicate-set))
+                              (concat "dup-" name))))
+        
+        ;; Create a duplicate set if this is the first duplication
+        (unless (gethash duplicate-set grease--duplicate-sets)
+          (puthash duplicate-set (list id) grease--duplicate-sets))
+        
+        ;; Add to duplicate tracking
+        (grease--add-to-duplicate-set duplicate-set new-id)
+        
+        ;; Add the duplicate line
+        (end-of-line)
+        (insert "\n" (format "%d: %s" new-id 
+                            (if (eq type 'dir) (concat name "/") name)))
+        
+        ;; Store the new entry metadata
+        (puthash new-id
+                (list :name name
+                      :original-name (or original-name name)
+                      :type type
+                      :is-duplicate t
+                      :source-name (or original-name name)
+                      :duplicate-set duplicate-set)
+                grease--id-to-file)
+        
+        ;; Update the existing entry to be part of the duplicate set too
+        (when orig-data
+          (setf (plist-get orig-data :duplicate-set) duplicate-set)
+          (puthash id orig-data grease--id-to-file))
+        
+        (setq grease--next-id (1+ grease--next-id))
+        (message "Duplicated: %s" name)))))
+
+(defun grease-copy-filename ()
+  "Copy the current filename to kill ring."
+  (interactive)
+  (let* ((line-text (buffer-substring-no-properties 
+                     (line-beginning-position) (line-end-position)))
+         (parsed (grease--parse-line line-text)))
+    (when parsed
+      (let ((name (plist-get parsed :name)))
+        (kill-new name)
+        (message "Copied filename: %s" name)))))
 
 ;;;; Change Calculation (Diff Engine)
 
@@ -227,68 +401,68 @@
                `(:copy ,(concat dir src) ,(concat dir dst))))))
       (push modified-change grease--global-changes))))
 
-(defun grease--collect-current-state ()
-  "Collect all file entries in the buffer including metadata."
-  (let ((files '()))
-    (save-excursion
-      (goto-char (point-min))
-      (forward-line 1) ; Skip header
-      (while (not (eobp))
-        (let ((info (grease--get-line-info)))
-          (when info
-            (push info files)))
-        (forward-line 1)))
-    (nreverse files)))
-
-(defun grease--detect-name-conflicts (files)
-  "Check for duplicate filenames in FILES."
+(defun grease--detect-name-conflicts ()
+  "Check for duplicate filenames that aren't marked as duplicates."
   (let ((names (make-hash-table :test 'equal))
         (conflicts '()))
-    (dolist (info files)
-      (let* ((name (plist-get info :current-name))
-             (count (gethash name names 0)))
-        (when (> count 0) 
-          (push name conflicts))
-        (puthash name (1+ count) names)))
+    
+    (maphash (lambda (_id data)
+               (let* ((name (plist-get data :name))
+                      (is-duplicate (plist-get data :is-duplicate))
+                      (duplicate-set (plist-get data :duplicate-set)))
+                 ;; Only count non-duplicates for conflict detection
+                 (unless (or is-duplicate duplicate-set)
+                   (let ((count (gethash name names 0)))
+                     (when (> count 0) 
+                       (push name conflicts))
+                     (puthash name (1+ count) names)))))
+             grease--id-to-file)
+    
     conflicts))
 
-;; --- CHANGE: Rewritten change calculation logic for clarity and correctness ---
 (defun grease--calculate-changes ()
   "Calculate the changes between original state and current buffer."
+  ;; First scan the buffer to update entries
+  (grease--scan-buffer)
+  
   (let* ((changes '())
          (original-files (copy-hash-table grease--original-state))
-         (current-state (grease--collect-current-state))
          (seen-originals (make-hash-table :test 'equal))
-         (name-conflicts (grease--detect-name-conflicts current-state)))
+         (name-conflicts (grease--detect-name-conflicts)))
 
     (when name-conflicts
       (user-error "Filename conflicts detected: %s" (mapconcat #'identity name-conflicts ", ")))
-
-    (dolist (info current-state)
-      (let ((original (plist-get info :original-name))
-            (current (plist-get info :current-name))
-            (type (plist-get info :file-type))
-            (is-duplicate (plist-get info :is-duplicate))
-            (source-name (plist-get info :source-name)))
-        
-        (cond
-         ;; Case 1: A duplicated line, which is a copy.
-         (is-duplicate
-          (push `(:copy ,source-name ,current) changes)
-          ;; Mark the source as "seen" so it's not considered deleted.
-          (puthash source-name t seen-originals))
-
-         ;; Case 2: An existing file that was not duplicated.
-         (original
-          (puthash original t seen-originals)
-          ;; Check for rename.
-          (unless (grease--names-equal current type original (gethash original grease--original-state))
-            (push `(:rename ,original ,current) changes)))
-
-         ;; Case 3: New file, created from scratch.
-         ((not original)
-          (push `(:create ,current) changes)))))
-
+    
+    ;; Process all entries
+    (maphash (lambda (_id data)
+               (let ((original (plist-get data :original-name))
+                     (current (plist-get data :name))
+                     (type (plist-get data :type))
+                     (is-duplicate (plist-get data :is-duplicate))
+                     (source-name (plist-get data :source-name))
+                     (duplicate-set (plist-get data :duplicate-set)))
+                 
+                 (cond
+                  ;; Case 1: A duplicated line, which is a copy.
+                  ((or is-duplicate duplicate-set)
+                   (push `(:copy ,(or source-name original current) 
+                           ,(grease--normalize-name current type)) 
+                         changes)
+                   ;; Mark the source as "seen" so it's not considered deleted.
+                   (puthash (or source-name original) t seen-originals))
+                  
+                  ;; Case 2: An existing file that was not duplicated.
+                  ((and original (gethash original original-files))
+                   (puthash original t seen-originals)
+                   ;; Check for rename.
+                   (unless (grease--names-equal current type original (gethash original original-files))
+                     (push `(:rename ,original ,(grease--normalize-name current type)) changes)))
+                  
+                  ;; Case 3: New file, created from scratch.
+                  (t
+                   (push `(:create ,(grease--normalize-name current type)) changes)))))
+             grease--id-to-file)
+    
     ;; Case 4: Any original file not seen in the current buffer was deleted.
     (maphash (lambda (name type)
                (unless (gethash name seen-originals)
@@ -306,7 +480,6 @@
         (`(:create ,name)
          (let ((abs (expand-file-name (grease--strip-trailing-slash name) grease--root-dir)))
            (message "Grease: Creating %s" abs)
-           ;; --- CHANGE: Fix file creation ---
            (condition-case e (if (grease--is-dir-name name) 
                                 (make-directory abs)
                               (write-region "" nil abs t)) ; 't' creates the file
@@ -366,13 +539,20 @@
 (defun grease-visit ()
   "Visit the file or directory at point."
   (interactive)
-  (let* ((info (grease--get-line-info))
-         (name (plist-get info :current-name)))
-    (if (not name) 
+  (let* ((line-text (buffer-substring-no-properties 
+                     (line-beginning-position) (line-end-position)))
+         (parsed (grease--parse-line line-text)))
+    
+    (if (not parsed) 
         (user-error "Not on a file or directory line.")
-      (let* ((clean-name (string-trim name))
-             (path (expand-file-name (grease--strip-trailing-slash clean-name) grease--root-dir)))
-        (if (grease--is-dir-name clean-name)
+      (let* ((id (plist-get parsed :id))
+             (data (gethash id grease--id-to-file))
+             (name (plist-get parsed :name))
+             (type (if data 
+                      (plist-get data :type)
+                    (if (grease--is-dir-name name) 'dir 'file)))
+             (path (expand-file-name (grease--strip-trailing-slash name) grease--root-dir)))
+        (if (eq type 'dir)
             (progn
               (when grease--buffer-dirty-p
                 (let ((changes (grease--calculate-changes)))
@@ -415,55 +595,11 @@
 
 ;;;; Major Mode Definition
 
-(defun grease--on-change (_beg _end _len)
-  "Hook run after buffer changes to mark it dirty."
-  (unless grease--change-hook-active
-    (let ((grease--change-hook-active t))
-      (setq grease--buffer-dirty-p t))))
-
-(defun grease--fix-line (line)
-  "Format a line with proper icon based on its content."
-  (save-excursion
-    (goto-char (point-at-bol line))
-    (let* ((bol (line-beginning-position))
-           (eol (line-end-position))
-           (line-content (buffer-substring-no-properties bol eol)))
-      
-      (unless (or (= line 1) (string-match-p "^\\s-*$" line-content))
-        (let* ((inhibit-read-only t)
-               (inhibit-modification-hooks t)
-               (has-icon (text-property-any bol eol 'read-only t))
-               (name-start (if has-icon 
-                              (next-single-property-change bol 'read-only nil eol)
-                            bol))
-               (name (if name-start 
-                        (string-trim (buffer-substring-no-properties name-start eol))
-                      (string-trim line-content)))
-               (original-name (when name-start (get-text-property name-start 'grease-original-name)))
-               (file-type (when name-start (get-text-property name-start 'grease-file-type)))
-               (copy-id (when name-start (get-text-property name-start 'grease-copy-id)))
-               (is-duplicate (when name-start (get-text-property name-start 'grease-is-duplicate)))
-               (source-name (when name-start (get-text-property name-start 'grease-source-name))))
-          
-          (when (and name (not (string-empty-p name))
-                     (or (not has-icon)
-                         (not (string-match-p "^[📁📄]\\|^\\S-+ " line-content))))
-            (delete-region bol eol)
-            (let ((type (or file-type (if (grease--is-dir-name name) 'dir 'file))))
-              (grease--insert-entry name type original-name copy-id is-duplicate source-name))))))))
-
-(defun grease--after-change-hook ()
-  "After change hook to fix lines when needed."
-  ;; --- CHANGE: Disable this hook as it's not needed for the simplified, no-icon version ---
-  ;; (unless grease--change-hook-active
-  ;;   (let ((grease--change-hook-active t))
-  ;;     (let ((line (line-number-at-pos)))
-  ;;       (grease--fix-line line))))
-  )
-
 (defvar grease-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-s") #'grease-save)
+    (define-key map (kbd "C-c C-d") #'grease-duplicate-line) 
+    (define-key map (kbd "C-c C-c") #'grease-copy-filename)
     map)
   "Keymap for `grease-mode'.")
 
@@ -471,8 +607,7 @@
   "A major mode for oil.nvim-style file management."
   :syntax-table nil
   (setq-local truncate-lines t)
-  (add-hook 'after-change-functions #'grease--on-change nil t)
-  (add-hook 'post-command-hook #'grease--after-change-hook nil t))
+  (add-hook 'after-change-functions #'grease--on-change nil t))
 
 ;; Set up minimal Evil keybindings - only for special functions
 (when (fboundp 'evil-define-key*)
@@ -480,7 +615,8 @@
     (kbd "RET") #'grease-visit
     (kbd "-") #'grease-up-directory  
     (kbd "g r") #'grease-refresh
-    (kbd "q") #'grease-quit))
+    (kbd "q") #'grease-quit
+    (kbd "yf") #'grease-copy-filename)) ; Use yf for copy filename
 
 ;;;; Entry Points
 
