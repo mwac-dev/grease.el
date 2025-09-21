@@ -24,8 +24,8 @@
 (eval-when-compile (require 'nerd-icons nil t))
 (eval-when-compile (require 'evil nil t))
 
-;; --- CHANGE: Icons temporarily disabled via this const ---
-(defconst grease--use-icons nil
+;; Enable icons by default if available
+(defconst grease--use-icons (featurep 'nerd-icons)
   "Non-nil to display icons next to filenames.")
 
 (defconst grease--have-icons (and grease--use-icons (featurep 'nerd-icons))
@@ -45,21 +45,21 @@
 (defvar-local grease--change-hook-active nil
   "Flag to prevent recursive change hooks.")
 
-(defvar-local grease--id-to-file nil
-  "Hash table mapping numeric IDs to file metadata.")
+;; Enhanced global clipboard for cross-directory operations
+(defvar grease--clipboard nil
+  "Global clipboard for cross-directory operations.
+Structure: (:paths (PATH) :operation 'move|'copy)")
 
-(defvar-local grease--next-id 1
-  "Next available ID for file entries.")
+(defvar-local grease--pending-changes nil
+  "List of pending file operations in current buffer.")
 
-(defvar grease--global-clipboard nil
-  "Global clipboard for cross-directory operations.")
-
-(defvar-local grease--global-changes nil
-  "List of changes across directory navigation.")
-
-;; New tracking for duplicate sets
+;; Tracking for duplicate sets
 (defvar-local grease--duplicate-sets nil
   "Hash table tracking groups of duplicated files.")
+
+;; Prefixes for hidden IDs
+(defconst grease--id-prefix "/"
+  "Prefix for hidden file IDs.")
 
 ;;;; Core Helpers
 
@@ -79,18 +79,17 @@
       (if (grease--is-dir-name name) name (concat name "/"))
     (grease--strip-trailing-slash name)))
 
-(defun grease--names-equal (name1 type1 name2 type2)
-  "Compare two filenames, normalizing for directories with/without slashes."
-  (string= (grease--normalize-name name1 type1)
-           (grease--normalize-name name2 type2)))
-
 (defun grease--get-icon (name)
   "Get appropriate icon for NAME."
   (if grease--have-icons
       (if (grease--is-dir-name name)
           (nerd-icons-icon-for-dir name)
         (nerd-icons-icon-for-file name))
-    (if (grease--is-dir-name name) "📁" "📄")))
+    (if (grease--is-dir-name name) "📁 " "📄 ")))
+
+(defun grease--get-full-path (name)
+  "Get full path for NAME in current directory."
+  (expand-file-name (grease--strip-trailing-slash name) grease--root-dir))
 
 (defun grease--get-line-text (line-number)
   "Get the text of LINE-NUMBER without properties."
@@ -99,10 +98,14 @@
     (forward-line (1- line-number))
     (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
 
+(defun grease--format-id (id)
+  "Format ID as a 3-digit string with leading zeroes."
+  (format "%03d" id))
+
 (defun grease--parse-line (line-text)
   "Parse LINE-TEXT into components.
-Returns a plist with :id and :name."
-  (if (string-match "^\\([0-9]+\\):\\s-*\\(.*\\)$" line-text)
+Handles oil.nvim-style hidden IDs."
+  (if (string-match (concat "^" grease--id-prefix "\\([0-9]\\{3\\}\\)\\s-*\\(.*\\)$") line-text)
       (let* ((id-str (match-string 1 line-text))
              (name (match-string 2 line-text))
              (id (string-to-number id-str)))
@@ -110,60 +113,75 @@ Returns a plist with :id and :name."
     ;; For lines without IDs (newly inserted)
     (list :id nil :name (string-trim line-text))))
 
-(defun grease--get-line-info ()
-  "Return information about the current line."
-  (let* ((line-text (buffer-substring-no-properties 
-                    (line-beginning-position) (line-end-position)))
-         (parsed (grease--parse-line line-text)))
-    (when parsed
-      (let* ((id (plist-get parsed :id))
-             (metadata (when id (gethash id grease--id-to-file))))
-        (or metadata
-            (list :name (plist-get parsed :name)
-                  :type (if (grease--is-dir-name (plist-get parsed :name)) 'dir 'file)))))))
+(defun grease--extract-filename (text)
+  "Extract just the filename from TEXT, removing ID and icon.
+This is a critical function for proper filename handling."
+  ;; First try to match with hidden ID format
+  (if (string-match (concat "^" grease--id-prefix "[0-9]\\{3\\}\\s-+\\(.*\\)$") text)
+      ;; Got the text after the ID, now extract just the filename (after any icon)
+      (let ((content (match-string 1 text)))
+        ;; Look for the first alphanumeric or allowed special char that starts the filename
+        (if (string-match "\\(?:[^\n[:alnum:]/._-]\\s-*\\)*\\([[:alnum:]/._-].*\\)$" content)
+            (match-string 1 content)
+          content)) ;; Fallback to the whole content
+    ;; No ID, try to extract filename directly
+    (if (string-match "\\(?:[^\n[:alnum:]/._-]\\s-*\\)*\\([[:alnum:]/._-].*\\)$" text)
+        (match-string 1 text)
+      ;; Last resort fallback
+      (string-trim text))))
 
 ;;;; Buffer Rendering and Management
 
-(defun grease--insert-entry (id name type &optional original-name is-duplicate source-name duplicate-set)
+(defun grease--insert-entry (id name type &optional original-name is-duplicate source-name)
   "Insert a formatted line for file with ID, NAME and TYPE."
   (let* ((original-name (or original-name name))
          (is-dir (eq type 'dir))
          (display-name (if is-dir (concat name "/") name))
-         (start (point))
-         (data (list :name name
-                     :original-name original-name
-                     :type type
-                     :is-duplicate (or is-duplicate nil)
-                     :source-name source-name
-                     :duplicate-set duplicate-set)))
+         (id-str (grease--format-id id))
+         (full-id (concat grease--id-prefix id-str))
+         (start (point)))
     
-    ;; Store in ID map
-    (puthash id data grease--id-to-file)
+    ;; Insert hidden ID - invisible but not read-only
+    (insert full-id " ")
+    (put-text-property start (point) 'invisible t)
+    (put-text-property start (point) 'grease-prefix t)
     
-    ;; Insert the visible content
+    ;; Insert icon if enabled
     (when grease--use-icons
-      (let ((icon (grease--get-icon display-name)))
-        (insert icon " ")
-        (add-text-properties start (point) 
-                             '(read-only t rear-nonsticky t front-sticky nil))
-        (setq start (point))))
+      (let* ((icon-start (point))
+             (icon (grease--get-icon display-name)))
+        (insert icon)
+        (put-text-property icon-start (point) 'grease-icon t)))
 
-    (insert (format "%d: %s" id display-name))
-    (put-text-property start (point) 'face 'font-lock-function-name-face)
+    ;; Insert the visible filename
+    (let ((name-start (point)))
+      (insert display-name)
+      
+      ;; Store metadata as text properties on the whole line
+      (add-text-properties start (point)
+                          (list 'grease-id id
+                                'grease-name name
+                                'grease-type type
+                                'grease-original-name original-name
+                                'grease-is-duplicate is-duplicate
+                                'grease-source-name source-name))
+      
+      ;; Add face to the name part only
+      (put-text-property name-start (point) 'face 'font-lock-function-name-face))
+    
     (insert "\n")))
 
 (defun grease--render (dir &optional keep-changes)
   "Render the contents of DIR into the current buffer."
   (let ((inhibit-read-only t)
-        (inhibit-modification-hooks t))
+        (inhibit-modification-hooks t)
+        (next-id 1))
     (erase-buffer)
     (setq grease--root-dir (file-name-as-directory (expand-file-name dir)))
     (setq grease--original-state (make-hash-table :test 'equal))
-    (setq grease--id-to-file (make-hash-table :test 'eql))
     (setq grease--duplicate-sets (make-hash-table :test 'equal))
-    (setq grease--next-id 1)
     (unless keep-changes
-      (setq grease--global-changes nil))
+      (setq grease--pending-changes nil))
     (setq grease--buffer-dirty-p nil)
     
     ;; Insert header
@@ -177,119 +195,203 @@ Returns a plist with :id and :name."
            (files (cl-remove-if (lambda (f) (member f '("." ".."))) all-files)))
       (dolist (file (sort files #'string<))
         (let* ((abs-path (expand-file-name file grease--root-dir))
-               (type (if (file-directory-p abs-path) 'dir 'file))
-               (id grease--next-id))
+               (type (if (file-directory-p abs-path) 'dir 'file)))
           (puthash file type grease--original-state)
-          (grease--insert-entry id file type)
-          (setq grease--next-id (1+ grease--next-id)))))
+          (grease--insert-entry next-id file type file)
+          (setq next-id (1+ next-id)))))
     
     (goto-char (point-min))
     (forward-line 1)))
 
-;;;; Buffer Change Tracking
+;;;; Cursor Control and Evil Integration
 
-(defun grease--add-to-duplicate-set (set-id id)
-  "Add ID to the duplicate SET-ID."
-  (let ((set (gethash set-id grease--duplicate-sets)))
-    (if set
-        (push id set)
-      (setq set (list id)))
-    (puthash set-id set grease--duplicate-sets)))
+(defun grease--constrain-cursor ()
+  "Ensure cursor is positioned after the file prefix and icon."
+  (when (and (derived-mode-p 'grease-mode)
+             (not (= (line-number-at-pos) 1))) ; Skip header line
+    (let ((pos (point))
+          (bol (line-beginning-position))
+          (prefix-end nil))
+      
+      ;; Find the end of the prefix (ID + icon)
+      (save-excursion
+        (goto-char bol)
+        (if (re-search-forward (concat grease--id-prefix "[0-9]\\{3\\} ") (line-end-position) t)
+            (setq prefix-end (point))
+          (setq prefix-end bol)))
+      
+      ;; If icon exists, move past it too
+      (when (and prefix-end (> prefix-end bol))
+        (save-excursion
+          (goto-char prefix-end)
+          (while (and (< prefix-end (line-end-position))
+                      (get-text-property prefix-end 'grease-icon))
+            (setq prefix-end (1+ prefix-end)))))
+      
+      ;; Move cursor if it's before the filename part
+      (when (and prefix-end (< pos prefix-end))
+        (goto-char prefix-end)))))
 
-(defun grease--scan-buffer ()
-  "Scan buffer and update file tracking data."
-  (let ((new-id-to-file (make-hash-table :test 'eql))
-        (names-to-ids (make-hash-table :test 'equal))
-        (new-duplicate-sets (make-hash-table :test 'equal)))
-    
-    ;; First pass: collect all entries
+(defun grease--get-line-data (&optional pos)
+  "Get file data from current line or at POS."
+  (let* ((pos (or pos (point)))
+         (line-beg (save-excursion 
+                     (goto-char pos)
+                     (line-beginning-position))))
+    (when (and (> (line-number-at-pos pos) 1)  ; Skip header
+               (get-text-property line-beg 'grease-name))
+      (list :name (get-text-property line-beg 'grease-name)
+            :type (get-text-property line-beg 'grease-type)
+            :original-name (get-text-property line-beg 'grease-original-name)
+            :is-duplicate (get-text-property line-beg 'grease-is-duplicate)
+            :source-name (get-text-property line-beg 'grease-source-name)
+            :id (get-text-property line-beg 'grease-id)))))
+
+;; Evil integration hooks
+(defun grease--on-evil-yank (beg end &rest _)
+  "Handle yank operation for clipboard."
+  (when (derived-mode-p 'grease-mode)
+    (let ((data (grease--get-line-data)))
+      (when data
+        (let* ((name (plist-get data :name))
+               (type (plist-get data :type))
+               (path (grease--get-full-path name)))
+          ;; Store in clipboard
+          (setq grease--clipboard 
+                (list :paths (list path)
+                      :names (list name)
+                      :types (list type)
+                      :operation 'copy))
+          (message "Copied file: %s" name))))))
+
+(defun grease--on-evil-delete (beg end &rest _)
+  "Handle delete operation for clipboard."
+  (when (derived-mode-p 'grease-mode)
+    (let ((data (grease--get-line-data)))
+      (when data
+        (let* ((name (plist-get data :name))
+               (type (plist-get data :type))
+               (path (grease--get-full-path name)))
+          ;; Store in clipboard
+          (setq grease--clipboard 
+                (list :paths (list path)
+                      :names (list name)
+                      :types (list type)
+                      :operation 'move))
+          (message "Cut file: %s" name))))))
+
+;; Track the last yanked text to handle paste properly
+(defvar grease--last-yanked-text nil
+  "Last text yanked in grease mode, for paste handling.")
+
+(defun grease--intercept-yanked-text (text)
+  "Track yanked TEXT from grease buffer."
+  (when (derived-mode-p 'grease-mode)
+    (setq grease--last-yanked-text text)))
+
+(defun grease--create-new-entry (file-name)
+  "Create a new entry with FILE-NAME properly formatted."
+  (let* ((is-dir (grease--is-dir-name file-name))
+         (type (if is-dir 'dir 'file))
+         (next-id (save-excursion
+                    (goto-char (point-min))
+                    (let ((max-id 0))
+                      (while (re-search-forward 
+                              (concat "^" grease--id-prefix "\\([0-9]\\{3\\}\\)") nil t)
+                        (let ((id (string-to-number (match-string 1))))
+                          (when (> id max-id)
+                            (setq max-id id))))
+                      (1+ max-id)))))
+    ;; Clear the line and insert properly formatted entry
+    (delete-region (line-beginning-position) (line-end-position))
+    (grease--insert-entry next-id 
+                         (grease--strip-trailing-slash file-name)
+                         type)))
+
+(defun grease--handle-paste-line (line-text)
+  "Process pasted LINE-TEXT to properly format it for grease buffer."
+  (let ((file-name (grease--extract-filename line-text)))
+    (when (not (string-empty-p file-name))
+      (grease--create-new-entry file-name))))
+
+(defun grease--after-paste (beg end)
+  "Process pasted text between BEG and END."
+  (when (derived-mode-p 'grease-mode)
     (save-excursion
-      (goto-char (point-min))
-      (forward-line 1) ; Skip header
-      (while (not (eobp))
-        (let* ((line-text (buffer-substring-no-properties 
-                           (line-beginning-position) (line-end-position)))
-               (parsed (grease--parse-line line-text)))
-          (when parsed
-            (let* ((id (plist-get parsed :id))
-                   (name (plist-get parsed :name))
-                   (is-dir (grease--is-dir-name name))
-                   (name-clean (if is-dir (grease--strip-trailing-slash name) name))
-                   (type (if is-dir 'dir 'file))
-                   (existing (and id (gethash id grease--id-to-file)))
-                   (original-name (when existing (plist-get existing :original-name)))
-                   (is-duplicate (when existing (plist-get existing :is-duplicate)))
-                   (source-name (when existing (plist-get existing :source-name)))
-                   (duplicate-set (when existing (plist-get existing :duplicate-set))))
-              
-              ;; Track entries by name
-              (push id (gethash name-clean names-to-ids nil))
-              
-              ;; Store entry data
-              (when id  ; Only store entries with IDs
-                (puthash id 
-                        (list :name name-clean
-                              :original-name (or original-name name-clean)
-                              :type type
-                              :is-duplicate (or is-duplicate nil)
-                              :source-name source-name
-                              :duplicate-set duplicate-set)
-                        new-id-to-file)))))
+      (goto-char beg)
+      (while (< (point) end)
+        (when (not (= (line-number-at-pos) 1)) ; Skip header
+          (let ((line-text (buffer-substring-no-properties
+                            (line-beginning-position) (line-end-position))))
+            (when (not (string-empty-p line-text))
+              (grease--handle-paste-line line-text))))
         (forward-line 1)))
     
-    ;; Second pass: handle duplicates
-    (maphash (lambda (name ids)
-               (when (> (length ids) 1)
-                 ;; Create a set ID based on the name
-                 (let ((set-id (concat "dup-" name)))
-                   ;; Update all entries in this set
-                   (dolist (id ids)
-                     (let ((data (gethash id new-id-to-file)))
-                       (setf (plist-get data :duplicate-set) set-id)
-                       (puthash id data new-id-to-file))
-                     ;; Add to the duplicate set
-                     (push id (gethash set-id new-duplicate-sets nil))))))
-             names-to-ids)
+    ;; Mark buffer as dirty
+    (setq grease--buffer-dirty-p t)
     
-    ;; Third pass: mark duplicates
-    (maphash (lambda (set-id ids)
-               (let ((ids-sorted (sort ids #'<))
-                     (original-id (car (last (sort (copy-sequence ids) #'<)))))
-                 ;; The last ID (highest number) is considered the original
-                 (dolist (id ids-sorted)
-                   (unless (= id original-id)
-                     (let* ((data (gethash id new-id-to-file))
-                            (orig-data (gethash original-id new-id-to-file)))
-                       (setf (plist-get data :is-duplicate) t
-                             (plist-get data :source-name) 
-                             (or (plist-get orig-data :original-name)
-                                 (plist-get orig-data :name)))
-                       (puthash id data new-id-to-file))))))
-             new-duplicate-sets)
-    
-    ;; Update the tracking data
-    (setq grease--id-to-file new-id-to-file)
-    (setq grease--duplicate-sets new-duplicate-sets)))
+    ;; Process clipboard for cross-directory operations
+    (when grease--clipboard
+      (let* ((operation (plist-get grease--clipboard :operation))
+             (paths (plist-get grease--clipboard :paths))
+             (names (plist-get grease--clipboard :names))
+             (types (plist-get grease--clipboard :types)))
+        
+        ;; Process each path in clipboard for cross-directory operations
+        (cl-loop for path in paths
+                 for name in names
+                 for type in types
+                 for i from 0
+                 do
+                 (let ((dest-path (grease--get-full-path name))
+                       (source-dir (file-name-directory path)))
+                   
+                   ;; Only add to pending changes if cross-directory
+                   (when (and (not (string= path dest-path))
+                              (not (string= source-dir grease--root-dir)))
+                     (push (list (if (eq operation 'move) :move :copy)
+                                 path dest-path)
+                           grease--pending-changes))))
+        
+        ;; Clear clipboard if it was a move operation
+        (when (eq (plist-get grease--clipboard :operation) 'move)
+          (setq grease--clipboard nil))))))
 
-(defun grease--on-change (_beg _end _len)
-  "Hook run after buffer changes to mark it dirty."
-  (unless grease--change-hook-active
-    (let ((grease--change-hook-active t))
-      (setq grease--buffer-dirty-p t))))
+;; Add hooks for cursor position constraints
+(defun grease--setup-cursor-constraints ()
+  "Set up hooks to constrain cursor position."
+  (add-hook 'post-command-hook #'grease--constrain-cursor nil t))
 
-;;;; Evil Integration
-
-(defun grease--evil-advice-for-dd (orig-fun beg end &rest args)
-  "Allow `evil-delete-line` to work with read-only icons."
-  (if (and (derived-mode-p 'grease-mode)
-           (not (= (line-number-at-pos beg) 1)))
-      (let ((inhibit-read-only t))
-        (apply orig-fun beg end args))
-    (apply orig-fun beg end args)))
+;; Add advice to Evil commands
+(when (fboundp 'evil-yank-line)
+  (advice-add 'evil-yank-line :after #'grease--on-evil-yank)
+  (advice-add 'evil-yank :around
+              (lambda (orig-fun &rest args)
+                (let ((result (apply orig-fun args)))
+                  (when (derived-mode-p 'grease-mode)
+                    (grease--intercept-yanked-text (current-kill 0)))
+                  result))))
 
 (when (fboundp 'evil-delete-line)
-  (advice-add 'evil-delete-line :around #'grease--evil-advice-for-dd))
+  (advice-add 'evil-delete-line :after #'grease--on-evil-delete))
 
+(when (fboundp 'evil-paste-after)
+  (advice-add 'evil-paste-after :around
+              (lambda (orig-fun &rest args)
+                (let ((result (apply orig-fun args)))
+                  (when (derived-mode-p 'grease-mode)
+                    (grease--after-paste (evil-get-marker ?\[) (evil-get-marker ?\])))
+                  result))))
+
+(when (fboundp 'evil-paste-before)
+  (advice-add 'evil-paste-before :around
+              (lambda (orig-fun &rest args)
+                (let ((result (apply orig-fun args)))
+                  (when (derived-mode-p 'grease-mode)
+                    (grease--after-paste (evil-get-marker ?\[) (evil-get-marker ?\])))
+                  result))))
+
+;; Evil ex-command for save
 (when (fboundp 'evil-ex-define-cmd)
   (evil-ex-define-cmd "w[rite]" (lambda () 
                                   (interactive)
@@ -297,176 +399,189 @@ Returns a plist with :id and :name."
                                       (grease-save)
                                     (call-interactively #'evil-write)))))
 
-;; Add support for yanking/pasting with metadata
-(defun grease--advice-evil-paste (orig-fun &rest args)
-  "Advice to run after Evil paste commands."
-  (let ((result (apply orig-fun args)))
-    (when (derived-mode-p 'grease-mode)
-      (grease--scan-buffer))
-    result))
+;;;; Buffer Change Tracking
 
-;; Add advice to Evil paste commands
-(when (fboundp 'evil-paste-after)
-  (advice-add 'evil-paste-after :around #'grease--advice-evil-paste))
-(when (fboundp 'evil-paste-before)
-  (advice-add 'evil-paste-before :around #'grease--advice-evil-paste))
+(defun grease--update-line-metadata ()
+  "Update line metadata based on current visible text."
+  (when (derived-mode-p 'grease-mode)
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line 1) ; Skip header
+      (while (not (eobp))
+        (let* ((line-beg (line-beginning-position))
+               (line-end (line-end-position))
+               (line-data (grease--get-line-data (point))))
+          
+          ;; Only process lines with our metadata
+          (when line-data
+            (let* ((visible-text (buffer-substring-no-properties 
+                                  line-beg line-end))
+                   (clean-text (grease--extract-filename visible-text))
+                   (is-dir (grease--is-dir-name clean-text))
+                   (name (grease--strip-trailing-slash clean-text))
+                   (type (if is-dir 'dir 'file)))
+              
+              ;; Update text properties with new name
+              (put-text-property line-beg line-end 'grease-name name)
+              (put-text-property line-beg line-end 'grease-type type))))
+        
+        (forward-line 1)))))
 
-;;;; File Operation Helpers
-
-(defun grease-duplicate-line ()
-  "Duplicate the current line with unique metadata."
-  (interactive)
-  (let* ((line-text (buffer-substring-no-properties 
-                     (line-beginning-position) (line-end-position)))
-         (parsed (grease--parse-line line-text)))
+(defun grease--scan-buffer ()
+  "Scan buffer and update file tracking data."
+  ;; First update line metadata based on current text
+  (grease--update-line-metadata)
+  
+  (let ((entries '())
+        (name-to-entries (make-hash-table :test 'equal)))
     
-    (when parsed
-      (let* ((id (plist-get parsed :id))
-             (orig-data (when id (gethash id grease--id-to-file)))
-             (name (if orig-data (plist-get orig-data :name) (plist-get parsed :name)))
-             (type (if orig-data (plist-get orig-data :type) 
-                     (if (grease--is-dir-name (plist-get parsed :name)) 'dir 'file)))
-             (original-name (when orig-data (plist-get orig-data :original-name)))
-             (new-id grease--next-id)
-             (duplicate-set (or (when orig-data (plist-get orig-data :duplicate-set))
-                              (concat "dup-" name))))
+    ;; Collect all entries
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line 1) ; Skip header
+      (while (not (eobp))
+        (let* ((line-beg (line-beginning-position))
+               (line-data (grease--get-line-data (point))))
+          
+          ;; Process the line if it has our file metadata
+          (when line-data
+            (let* ((name (plist-get line-data :name))
+                   (type (plist-get line-data :type))
+                   (original-name (plist-get line-data :original-name))
+                   (is-duplicate (plist-get line-data :is-duplicate))
+                   (source-name (plist-get line-data :source-name))
+                   (id (plist-get line-data :id))
+                   (data (list :name name
+                               :type type
+                               :id id
+                               :original-name original-name
+                               :is-duplicate is-duplicate
+                               :source-name source-name)))
+              
+              (push data entries)
+              ;; Track by name for duplicate detection
+              (push data (gethash name name-to-entries nil)))))
         
-        ;; Create a duplicate set if this is the first duplication
-        (unless (gethash duplicate-set grease--duplicate-sets)
-          (puthash duplicate-set (list id) grease--duplicate-sets))
-        
-        ;; Add to duplicate tracking
-        (grease--add-to-duplicate-set duplicate-set new-id)
-        
-        ;; Add the duplicate line
-        (end-of-line)
-        (insert "\n" (format "%d: %s" new-id 
-                            (if (eq type 'dir) (concat name "/") name)))
-        
-        ;; Store the new entry metadata
-        (puthash new-id
-                (list :name name
-                      :original-name (or original-name name)
-                      :type type
-                      :is-duplicate t
-                      :source-name (or original-name name)
-                      :duplicate-set duplicate-set)
-                grease--id-to-file)
-        
-        ;; Update the existing entry to be part of the duplicate set too
-        (when orig-data
-          (setf (plist-get orig-data :duplicate-set) duplicate-set)
-          (puthash id orig-data grease--id-to-file))
-        
-        (setq grease--next-id (1+ grease--next-id))
-        (message "Duplicated: %s" name)))))
+        (forward-line 1)))
+    
+    ;; Mark duplicates
+    (maphash (lambda (name entry-list)
+               (when (> (length entry-list) 1)
+                 ;; Mark all but the last as duplicates
+                 (let ((entries-sorted (sort (copy-sequence entry-list)
+                                             (lambda (a b) 
+                                               (< (or (plist-get a :id) 0)
+                                                  (or (plist-get b :id) 0))))))
+                   (let ((original (car (last entries-sorted))))
+                     (dolist (entry (butlast entries-sorted))
+                       (setf (plist-get entry :is-duplicate) t
+                             (plist-get entry :source-name) 
+                             (or (plist-get original :original-name)
+                                 (plist-get original :name))))))))
+             name-to-entries)
+    
+    ;; Return the collected entries
+    (nreverse entries)))
 
-(defun grease-copy-filename ()
-  "Copy the current filename to kill ring."
-  (interactive)
-  (let* ((line-text (buffer-substring-no-properties 
-                     (line-beginning-position) (line-end-position)))
-         (parsed (grease--parse-line line-text)))
-    (when parsed
-      (let ((name (plist-get parsed :name)))
-        (kill-new name)
-        (message "Copied filename: %s" name)))))
+(defun grease--on-change (_beg _end _len)
+  "Hook run after buffer changes to mark it dirty."
+  (unless grease--change-hook-active
+    (let ((grease--change-hook-active t))
+      (setq grease--buffer-dirty-p t))))
 
 ;;;; Change Calculation (Diff Engine)
 
 (defun grease--format-change (change)
   "Format CHANGE for display in confirmation prompt."
   (pcase change
-    (`(:create ,name) (format "  [Create] %s" name))
-    (`(:delete ,name) (format "  [Delete] %s" name))
-    (`(:rename ,old ,new) (format "  [Rename] %s -> %s" old new))
-    (`(:move ,src ,dst) (format "  [Move]   %s -> %s" src dst))
-    (`(:copy ,src ,dst) (format "  [Copy]   %s -> %s" src dst))))
+    (`(:create ,path) 
+     (format "  [Create] %s" (file-name-nondirectory path)))
+    (`(:delete ,path) 
+     (format "  [Delete] %s" (file-name-nondirectory path)))
+    (`(:rename ,old ,new) 
+     (format "  [Rename] %s -> %s" 
+             (file-name-nondirectory old) 
+             (file-name-nondirectory new)))
+    (`(:move ,src ,dst) 
+     (format "  [Move]   %s -> %s" 
+             (file-name-nondirectory src) 
+             (file-name-nondirectory dst)))
+    (`(:copy ,src ,dst) 
+     (format "  [Copy]   %s -> %s" 
+             (file-name-nondirectory src) 
+             (file-name-nondirectory dst)))))
 
-(defun grease--add-to-global-changes (changes dir)
-  "Add CHANGES from DIR to the global changes list."
-  (dolist (change changes)
-    (let* ((change-type (car change))
-           (modified-change 
-            (pcase change
-              (`(:create ,name) 
-               `(:create ,(concat dir name)))
-              (`(:delete ,name) 
-               `(:delete ,(concat dir name)))
-              (`(:rename ,old ,new) 
-               `(:rename ,(concat dir old) ,(concat dir new)))
-              (`(:move ,src ,dst) 
-               `(:move ,(concat dir src) ,(concat dir dst)))
-              (`(:copy ,src ,dst) 
-               `(:copy ,(concat dir src) ,(concat dir dst))))))
-      (push modified-change grease--global-changes))))
-
-(defun grease--detect-name-conflicts ()
-  "Check for duplicate filenames that aren't marked as duplicates."
+(defun grease--detect-name-conflicts (entries)
+  "Check for duplicate filenames that aren't marked as duplicates in ENTRIES."
   (let ((names (make-hash-table :test 'equal))
         (conflicts '()))
     
-    (maphash (lambda (_id data)
-               (let* ((name (plist-get data :name))
-                      (is-duplicate (plist-get data :is-duplicate))
-                      (duplicate-set (plist-get data :duplicate-set)))
-                 ;; Only count non-duplicates for conflict detection
-                 (unless (or is-duplicate duplicate-set)
-                   (let ((count (gethash name names 0)))
-                     (when (> count 0) 
-                       (push name conflicts))
-                     (puthash name (1+ count) names)))))
-             grease--id-to-file)
+    (dolist (entry entries)
+      (let* ((name (plist-get entry :name))
+             (is-duplicate (plist-get entry :is-duplicate)))
+        ;; Only count non-duplicates for conflict detection
+        (unless is-duplicate
+          (let ((count (gethash name names 0)))
+            (when (> count 0) 
+              (push name conflicts))
+            (puthash name (1+ count) names)))))
     
     conflicts))
 
 (defun grease--calculate-changes ()
   "Calculate the changes between original state and current buffer."
-  ;; First scan the buffer to update entries
-  (grease--scan-buffer)
-  
-  (let* ((changes '())
+  (let* ((entries (grease--scan-buffer))
+         (changes '())
          (original-files (copy-hash-table grease--original-state))
          (seen-originals (make-hash-table :test 'equal))
-         (name-conflicts (grease--detect-name-conflicts)))
+         (name-conflicts (grease--detect-name-conflicts entries)))
 
+    ;; Check for naming conflicts
     (when name-conflicts
       (user-error "Filename conflicts detected: %s" (mapconcat #'identity name-conflicts ", ")))
     
+    ;; First add any pending changes (cross-directory operations)
+    (setq changes (append grease--pending-changes changes))
+    
     ;; Process all entries
-    (maphash (lambda (_id data)
-               (let ((original (plist-get data :original-name))
-                     (current (plist-get data :name))
-                     (type (plist-get data :type))
-                     (is-duplicate (plist-get data :is-duplicate))
-                     (source-name (plist-get data :source-name))
-                     (duplicate-set (plist-get data :duplicate-set)))
-                 
-                 (cond
-                  ;; Case 1: A duplicated line, which is a copy.
-                  ((or is-duplicate duplicate-set)
-                   (push `(:copy ,(or source-name original current) 
-                           ,(grease--normalize-name current type)) 
-                         changes)
-                   ;; Mark the source as "seen" so it's not considered deleted.
-                   (puthash (or source-name original) t seen-originals))
-                  
-                  ;; Case 2: An existing file that was not duplicated.
-                  ((and original (gethash original original-files))
-                   (puthash original t seen-originals)
-                   ;; Check for rename.
-                   (unless (grease--names-equal current type original (gethash original original-files))
-                     (push `(:rename ,original ,(grease--normalize-name current type)) changes)))
-                  
-                  ;; Case 3: New file, created from scratch.
-                  (t
-                   (push `(:create ,(grease--normalize-name current type)) changes)))))
-             grease--id-to-file)
+    (dolist (entry entries)
+      (let ((original (plist-get entry :original-name))
+            (current (plist-get entry :name))
+            (type (plist-get entry :type))
+            (is-duplicate (plist-get entry :is-duplicate))
+            (source-name (plist-get entry :source-name)))
+        
+        (cond
+         ;; Case 1: A duplicated line, which is a copy.
+         (is-duplicate
+          (let ((source-path 
+                 (if (file-name-absolute-p (or source-name original current))
+                     (or source-name original current)
+                   (expand-file-name (or source-name original current) grease--root-dir))))
+            (push `(:copy ,source-path 
+                    ,(grease--get-full-path current)) 
+                  changes))
+          ;; Mark the source as "seen" so it's not considered deleted.
+          (when source-name
+            (puthash (grease--strip-trailing-slash source-name) t seen-originals)))
+         
+         ;; Case 2: An existing file that was not duplicated.
+         ((and original (gethash original original-files))
+          (puthash original t seen-originals)
+          ;; Check for rename.
+          (unless (string= current original)
+            (push `(:rename ,(grease--get-full-path original) 
+                    ,(grease--get-full-path current)) 
+                  changes)))
+         
+         ;; Case 3: New file, created from scratch.
+         (t
+          (push `(:create ,(grease--get-full-path current)) changes)))))
     
     ;; Case 4: Any original file not seen in the current buffer was deleted.
     (maphash (lambda (name type)
                (unless (gethash name seen-originals)
-                 (push `(:delete ,(grease--normalize-name name type)) changes)))
+                 (push `(:delete ,(grease--get-full-path name)) changes)))
              original-files)
     
     ;; Sort changes for consistent application order (deletes first).
@@ -477,38 +592,51 @@ Returns a plist with :id and :name."
   (let ((errors '()))
     (dolist (change changes)
       (pcase change
-        (`(:create ,name)
-         (let ((abs (expand-file-name (grease--strip-trailing-slash name) grease--root-dir)))
-           (message "Grease: Creating %s" abs)
-           (condition-case e (if (grease--is-dir-name name) 
-                                (make-directory abs)
-                              (write-region "" nil abs t)) ; 't' creates the file
-             (error (push (format "Failed to create %s: %s" abs e) errors)))))
-        (`(:delete ,name)
-         (let* ((stripped (grease--strip-trailing-slash name)) 
-                (abs (expand-file-name stripped grease--root-dir)))
-           (message "Grease: Deleting %s" abs)
-           (condition-case e (if (file-directory-p abs) 
-                                (delete-directory abs t) 
-                              (delete-file abs))
-             (error (push (format "Failed to delete %s: %s" abs e) errors)))))
-        (`(:rename ,old ,new)
-         (let ((old-abs (expand-file-name (grease--strip-trailing-slash old) grease--root-dir))
-               (new-abs (expand-file-name (grease--strip-trailing-slash new) grease--root-dir)))
-           (message "Grease: Renaming %s -> %s" old-abs new-abs)
-           (condition-case e (rename-file old-abs new-abs t)
-             (error (push (format "Failed to rename %s: %s" old e) errors)))))
-        (`(:copy ,src ,dst)
-         (let ((src-abs (expand-file-name (grease--strip-trailing-slash src) grease--root-dir))
-               (dst-abs (expand-file-name (grease--strip-trailing-slash dst) grease--root-dir)))
-           (if (string= src-abs dst-abs)
-               (message "Grease: Skipping copy to same location %s" src-abs)
-             (message "Grease: Copying %s -> %s" src-abs dst-abs)
-             (condition-case e 
-                 (if (file-directory-p src-abs) 
-                     (copy-directory src-abs dst-abs) 
-                   (copy-file src-abs dst-abs t))
-               (error (push (format "Failed to copy %s: %s" src e) errors))))))))
+        (`(:create ,path)
+         (message "Grease: Creating %s" path)
+         (condition-case e (if (string-suffix-p "/" path) 
+                             (make-directory path)
+                           (write-region "" nil path t)) ; 't' creates the file
+           (error (push (format "Failed to create %s: %s" path e) errors))))
+        
+        (`(:delete ,path)
+         (message "Grease: Deleting %s" path)
+         (condition-case e (if (file-directory-p path) 
+                             (delete-directory path t) 
+                           (delete-file path))
+           (error (push (format "Failed to delete %s: %s" path e) errors))))
+        
+        (`(:rename ,old-path ,new-path)
+         (message "Grease: Renaming %s -> %s" old-path new-path)
+         (condition-case e (rename-file old-path new-path t)
+           (error (push (format "Failed to rename %s: %s" old-path e) errors))))
+        
+        (`(:copy ,src-path ,dst-path)
+         (if (string= src-path dst-path)
+             (message "Grease: Skipping copy to same location %s" src-path)
+           (message "Grease: Copying %s -> %s" src-path dst-path)
+           (condition-case e 
+               (if (file-directory-p src-path) 
+                   (copy-directory src-path dst-path) 
+                 (copy-file src-path dst-path t))
+             (error (push (format "Failed to copy %s: %s" src-path e) errors)))))
+        
+        (`(:move ,src-path ,dst-path)
+         (message "Grease: Moving %s -> %s" src-path dst-path)
+         (condition-case e 
+             (progn
+               (if (file-directory-p src-path) 
+                   (copy-directory src-path dst-path)
+                 (copy-file src-path dst-path t))
+               (if (file-directory-p src-path)
+                   (delete-directory src-path t)
+                 (delete-file src-path)))
+           (error (push (format "Failed to move %s: %s" src-path e) errors))))))
+    
+    ;; Clear pending changes after successful operations
+    (when (and changes (not errors))
+      (setq grease--pending-changes nil))
+    
     (if errors
         (warn "Grease: Encountered errors:\n%s" (mapconcat #'identity errors "\n"))
       (message "Grease: All changes applied successfully."))))
@@ -524,11 +652,123 @@ Returns a plist with :id and :name."
       (if (y-or-n-p (format "Apply these changes?\n%s\n" (mapconcat #'grease--format-change changes "\n")))
           (progn 
             (grease--apply-changes changes) 
-            (when grease--global-changes
-              (setq grease--global-changes nil))
             (grease--render grease--root-dir) 
             t)
         (message "Grease: Save cancelled.") nil))))
+
+(defun grease-duplicate-line ()
+  "Duplicate the current line."
+  (interactive)
+  (let ((data (grease--get-line-data)))
+    (when data
+      (let* ((name (plist-get data :name))
+             (type (plist-get data :type))
+             (next-id (save-excursion
+                        (goto-char (point-min))
+                        (let ((max-id 0))
+                          (while (re-search-forward 
+                                  (concat "^" grease--id-prefix "\\([0-9]\\{3\\}\\)") nil t)
+                            (let ((id (string-to-number (match-string 1))))
+                              (when (> id max-id)
+                                (setq max-id id))))
+                          (1+ max-id)))))
+        ;; Add a new line with the duplicated content
+        (end-of-line)
+        (insert "\n")
+        (grease--insert-entry next-id name type nil t name)
+        (setq grease--buffer-dirty-p t)
+        (message "Duplicated: %s" name)))))
+
+(defun grease-cut ()
+  "Cut the current file/directory."
+  (interactive)
+  (let ((data (grease--get-line-data)))
+    (when data
+      (let* ((name (plist-get data :name))
+             (type (plist-get data :type))
+             (path (grease--get-full-path name)))
+        ;; Store in clipboard
+        (setq grease--clipboard 
+              (list :paths (list path)
+                    :names (list name)
+                    :types (list type)
+                    :operation 'move))
+        ;; Delete the line
+        (delete-region (line-beginning-position) (line-end-position))
+        (when (eobp) (delete-char -1))
+        (setq grease--buffer-dirty-p t)
+        (message "Cut file: %s" name)))))
+
+(defun grease-copy ()
+  "Copy the current file/directory."
+  (interactive)
+  (let ((data (grease--get-line-data)))
+    (when data
+      (let* ((name (plist-get data :name))
+             (type (plist-get data :type))
+             (path (grease--get-full-path name)))
+        ;; Store in clipboard
+        (setq grease--clipboard 
+              (list :paths (list path)
+                    :names (list name)
+                    :types (list type)
+                    :operation 'copy))
+        (message "Copied file: %s" name)))))
+
+(defun grease-paste ()
+  "Paste the cut/copied file/directory."
+  (interactive)
+  (if (not grease--clipboard)
+      (message "Nothing to paste.")
+    (let* ((operation (plist-get grease--clipboard :operation))
+           (paths (plist-get grease--clipboard :paths))
+           (names (plist-get grease--clipboard :names))
+           (types (plist-get grease--clipboard :types)))
+      
+      ;; Insert new entries for each item
+      (cl-loop for path in paths
+               for name in names
+               for type in types
+               for i from 0
+               do
+               (let* ((dest-name name)
+                      (next-id (save-excursion
+                                 (goto-char (point-min))
+                                 (let ((max-id 0))
+                                   (while (re-search-forward 
+                                           (concat "^" grease--id-prefix "\\([0-9]\\{3\\}\\)") nil t)
+                                     (let ((id (string-to-number (match-string 1))))
+                                       (when (> id max-id)
+                                         (setq max-id id))))
+                                   (1+ max-id)))))
+                 
+                 ;; Insert the new entry
+                 (save-excursion
+                   (end-of-line)
+                   (insert "\n")
+                   (grease--insert-entry next-id dest-name type nil 
+                                        (eq operation 'copy) path))))
+      
+      ;; Add cross-directory operations to pending changes
+      (cl-loop for path in paths
+               for name in names
+               for i from 0
+               do
+               (let ((dest-path (grease--get-full-path name))
+                     (source-dir (file-name-directory path)))
+                 
+                 ;; Only add to pending changes if cross-directory
+                 (when (and (not (string= path dest-path))
+                            (not (string= source-dir grease--root-dir)))
+                   (push (list (if (eq operation 'move) :move :copy)
+                               path dest-path)
+                         grease--pending-changes))))
+      
+      (setq grease--buffer-dirty-p t)
+      
+      ;; Clear clipboard if it was a move operation
+      (when (eq operation 'move)
+        (setq grease--clipboard nil)))))
 
 (defun grease--with-commit-prompt (action-fn)
   "Run ACTION-FN after saving if buffer is dirty."
@@ -539,25 +779,19 @@ Returns a plist with :id and :name."
 (defun grease-visit ()
   "Visit the file or directory at point."
   (interactive)
-  (let* ((line-text (buffer-substring-no-properties 
-                     (line-beginning-position) (line-end-position)))
-         (parsed (grease--parse-line line-text)))
-    
-    (if (not parsed) 
+  (let ((data (grease--get-line-data)))
+    (if (not data) 
         (user-error "Not on a file or directory line.")
-      (let* ((id (plist-get parsed :id))
-             (data (gethash id grease--id-to-file))
-             (name (plist-get parsed :name))
-             (type (if data 
-                      (plist-get data :type)
-                    (if (grease--is-dir-name name) 'dir 'file)))
-             (path (expand-file-name (grease--strip-trailing-slash name) grease--root-dir)))
+      (let* ((name (plist-get data :name))
+             (type (plist-get data :type))
+             (path (grease--get-full-path name)))
         (if (eq type 'dir)
             (progn
               (when grease--buffer-dirty-p
                 (let ((changes (grease--calculate-changes)))
                   (when changes
-                    (grease--add-to-global-changes changes grease--root-dir))))
+                    (setq grease--pending-changes 
+                          (append grease--pending-changes changes)))))
               (grease--render path t))
           (grease--with-commit-prompt
            (lambda () 
@@ -571,7 +805,8 @@ Returns a plist with :id and :name."
     (when grease--buffer-dirty-p
       (let ((changes (grease--calculate-changes)))
         (when changes
-          (grease--add-to-global-changes changes grease--root-dir))))
+          (setq grease--pending-changes 
+                (append grease--pending-changes changes)))))
     (grease--render parent-dir t)))
 
 (defun grease-refresh ()
@@ -579,18 +814,17 @@ Returns a plist with :id and :name."
   (interactive)
   (if (and grease--buffer-dirty-p (not (y-or-n-p "Discard all uncommitted changes?")))
       (message "Refresh cancelled.")
-    (setq grease--global-changes nil)
+    (setq grease--pending-changes nil)
+    (setq grease--clipboard nil)
     (grease--render grease--root-dir)
     (message "Grease: Refreshed.")))
 
 (defun grease-quit ()
   "Quit the grease buffer, prompting to save changes."
   (interactive)
-  (if (or grease--buffer-dirty-p grease--global-changes)
+  (if (or grease--buffer-dirty-p grease--pending-changes)
       (when (y-or-n-p "Save changes before quitting?")
-        (if grease--global-changes
-            (message "Global changes not yet implemented for save")
-          (grease-save)))
+        (grease-save))
     (kill-buffer (current-buffer))))
 
 ;;;; Major Mode Definition
@@ -598,8 +832,10 @@ Returns a plist with :id and :name."
 (defvar grease-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-s") #'grease-save)
-    (define-key map (kbd "C-c C-d") #'grease-duplicate-line) 
-    (define-key map (kbd "C-c C-c") #'grease-copy-filename)
+    (define-key map (kbd "C-c C-d") #'grease-duplicate-line)
+    (define-key map (kbd "C-c C-x") #'grease-cut)
+    (define-key map (kbd "C-c C-c") #'grease-copy)
+    (define-key map (kbd "C-c C-v") #'grease-paste)
     map)
   "Keymap for `grease-mode'.")
 
@@ -607,16 +843,16 @@ Returns a plist with :id and :name."
   "A major mode for oil.nvim-style file management."
   :syntax-table nil
   (setq-local truncate-lines t)
-  (add-hook 'after-change-functions #'grease--on-change nil t))
+  (add-hook 'after-change-functions #'grease--on-change nil t)
+  (grease--setup-cursor-constraints))
 
-;; Set up minimal Evil keybindings - only for special functions
+;; Set up Evil keybindings
 (when (fboundp 'evil-define-key*)
   (evil-define-key* 'normal grease-mode-map
     (kbd "RET") #'grease-visit
     (kbd "-") #'grease-up-directory  
     (kbd "g r") #'grease-refresh
-    (kbd "q") #'grease-quit
-    (kbd "yf") #'grease-copy-filename)) ; Use yf for copy filename
+    (kbd "q") #'grease-quit))
 
 ;;;; Entry Points
 
