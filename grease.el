@@ -549,21 +549,24 @@ Runs BEFORE Evil's delete (which will also yank)."
               :path (plist-get file-info :path))))))
 
 (defun grease--intercept-yanked-text (text)
-  "Track yanked TEXT from grease buffer and update clipboard if needed."
   (when (derived-mode-p 'grease-mode)
     (setq grease--last-yanked-text text)
-
-    ;; Try to extract file info from yanked text
-    (let ((info (grease--extract-line-info-from-text text)))
-      (when info
-        ;; Update clipboard to store info about the yanked file
-        (setq grease--clipboard
-              (list :paths (list (plist-get info :path))
-                    :names (list (plist-get info :name))
-                    :types (list (plist-get info :type))
-                    :ids (list (plist-get info :id))
-                    :original-dir grease--root-dir
-                    :operation 'copy))))))
+    (cond
+     ;; CUT operation – use clipboard as truth
+     ((eq grease--last-op-type 'cut)
+      ;; don’t trust raw text, reinsert from clipboard
+      (setq grease--last-yanked-text nil))
+     ;; COPY case – your existing logic
+     (t
+      (let ((info (grease--extract-line-info-from-text text)))
+        (when info
+          (setq grease--clipboard
+                (list :paths (list (plist-get info :path))
+                      :names (list (plist-get info :name))
+                      :types (list (plist-get info :type))
+                      :ids   (list (plist-get info :id))
+                      :original-dir grease--root-dir
+                      :operation 'copy))))))))
 
 (defun grease--get-next-id ()
   "Get the next available ID in the buffer."
@@ -658,15 +661,24 @@ Runs BEFORE Evil's delete (which will also yank)."
 
 ;; Intercept Evil's paste commands
 (defun grease--intercept-paste (orig-fun &rest args)
-  "Intercept paste commands to use grease-paste when appropriate."
+  "Intercept paste commands in `grease-mode`.
+  For cuts, bypass the kill-ring completely and insert from
+  `grease--clipboard`, since the kill-ring contains raw buffer text
+  (including hidden IDs and icons)."
   (if (and (derived-mode-p 'grease-mode)
-           ;; Only use grease-paste when:
-           (memq grease--last-op-type '(file cut copy))  ;; Last op was a file or cut operation
-           (eq grease--last-kill-index 0)   ;; Current kill is the most recent
-           grease--clipboard)               ;; We have clipboard data
-      ;; Use grease-paste for file operations
-      (grease-paste)
-    ;; Use normal paste for text operations
+           grease--clipboard)
+      (let ((op (plist-get grease--clipboard :operation)))
+        (cond
+         ;; Always bypass kill-ring for cuts
+         ((eq op 'cut)
+          (grease-paste))
+         ;; Copies behave like before
+         ((and (memq grease--last-op-type '(file copy))
+               (eq grease--last-kill-index 0))
+          (grease-paste))
+         ;; Fallback to normal paste
+         (t (apply orig-fun args))))
+    ;; Not in grease-mode or no clipboard → normal paste
     (apply orig-fun args)))
 
 ;; Apply advice to Evil paste commands
@@ -1152,41 +1164,48 @@ Returns a list of rename operations to be performed."
   (interactive)
   (if (not grease--clipboard)
       (message "Nothing to paste.")
-    (let* ((operation (plist-get grease--clipboard :operation))
-           (paths (plist-get grease--clipboard :paths))
-           (names (plist-get grease--clipboard :names))
-           (types (plist-get grease--clipboard :types))
-           (ids (plist-get grease--clipboard :ids))
+    (let* ((operation    (plist-get grease--clipboard :operation))
+           (paths        (plist-get grease--clipboard :paths))
+           (names        (plist-get grease--clipboard :names))
+           (types        (plist-get grease--clipboard :types))
+           (ids          (plist-get grease--clipboard :ids))
            (original-dir (plist-get grease--clipboard :original-dir))
            (is-cross-dir (not (string= original-dir grease--root-dir)))
-           (total-count (length names)))
+           (total-count  (length names)))
 
+      ;; Move to insertion point. If current line has content, create a fresh line first.
+      (end-of-line)
+      (when (not (string-empty-p
+                  (string-trim
+                   (buffer-substring-no-properties
+                    (line-beginning-position) (line-end-position)))))
+        (insert "\n"))
+      (beginning-of-line)
+
+      ;; Insert all entries sequentially with no extra blank lines.
       (cl-loop for path in paths
                for name in names
                for type in types
-               for id in ids
+               for id   in ids
                do
-               (let* ((next-id (grease--get-next-id))
-                      (copying (eq operation 'copy))
-                      (moving  (memq operation '(move cut))) ;; treat cut as move
+               (let* ((next-id     (grease--get-next-id))
+                      (copying     (eq operation 'copy))
+                      (moving      (memq operation '(move cut))) ; treat cut as move
                       (target-name (if (and copying (not is-cross-dir))
                                        (if (eq type 'dir)
                                            (concat (grease--strip-trailing-slash name) "-copy/")
                                          (grease--add-copy-suffix name))
                                      name)))
-                 (save-excursion
-                   (end-of-line)
-                   (insert "\n")
-                   (beginning-of-line)
-                   (cond
-                    (copying
-                     (grease--insert-entry next-id target-name type id t))
-                    (moving
-                     ;; Keep same ID for cut/move
-                     (grease--insert-entry id name type nil nil))
-                    (t
-                     (grease--insert-entry next-id name type nil nil))))))
+                 (cond
+                  (copying
+                   (grease--insert-entry next-id target-name type id t))
+                  (moving
+                   ;; Keep same ID for cut/move
+                   (grease--insert-entry id name type nil nil))
+                  (t
+                   (grease--insert-entry next-id name type nil nil)))))
 
+      ;; Update state
       (setq grease--last-op-type 'file)
       (setq grease--last-kill-index 0)
       (setq grease--buffer-dirty-p t)
@@ -1283,9 +1302,6 @@ Returns a list of rename operations to be performed."
     (kbd "RET") #'grease-visit
     (kbd "-") #'grease-up-directory
     (kbd "g r") #'grease-refresh)
-    ; (kbd "q") #'grease-quit
-    ; (kbd "y y") #'grease-copy
-    ; (kbd "d d") #'grease-cut)
   )
 
 ;;;; Entry Points
