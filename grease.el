@@ -24,6 +24,8 @@
 (eval-when-compile (require 'nerd-icons nil t))
 (eval-when-compile (require 'evil nil t))
 
+
+
 ;; Enable icons by default if available
 (defconst grease--use-icons (featurep 'nerd-icons)
   "Non-nil to display icons next to filenames.")
@@ -440,11 +442,16 @@ IS-DUPLICATE indicates if this is a copy of another file."
       (setq grease--multi-line-selection nil)))))
 
 ;; Evil integration hooks
-(defun grease--on-evil-yank (beg end &rest _)
-  "Handle yank operation for clipboard."
+
+(defvar grease--pending-cut nil
+  "Non-nil when a cut operation is in progress (before evil’s implicit yank).")
+
+(defun grease--on-evil-yank (_beg _end &rest _)
   (when (derived-mode-p 'grease-mode)
-    ;; Do not overwrite a pending CUT clipboard
-    (when (not (eq (plist-get grease--clipboard :operation) 'cut))
+    (if grease--pending-cut
+        ;; Ignore the yank that Evil does as part of delete
+        (setq grease--pending-cut nil)
+      ;; Real yank (yy/Vy): record as copy
       (grease--mark-as-grease-op)
       (if grease--multi-line-selection
           (setq grease--clipboard
@@ -454,56 +461,85 @@ IS-DUPLICATE indicates if this is a copy of another file."
             (let* ((name (plist-get data :name))
                    (type (plist-get data :type))
                    (path (grease--get-full-path name))
-                   (id (plist-get data :id)))
+                   (id   (plist-get data :id)))
               (setq grease--clipboard
                     (list :paths (list path)
                           :names (list name)
                           :types (list type)
-                          :ids (list id)
+                          :ids   (list id)
                           :original-dir grease--root-dir
                           :operation 'copy))
               (message "Copied file: %s" name))))))))
 
 (defun grease--before-evil-delete (&rest _)
-  "Handle delete operation for clipboard, run BEFORE the actual delete."
+  "Collect files about to be deleted and stage a CUT clipboard.
+Runs BEFORE Evil's delete (which will also yank)."
   (when (derived-mode-p 'grease-mode)
-    (let ((data (grease--get-line-data)))
-      (when data
-        (let* ((name (plist-get data :name))
-               (type (plist-get data :type))
-               (path (grease--get-full-path name))
-               (id   (plist-get data :id)))
-          ;; Store metadata in the global clipboard as a CUT (pending move)
-          (setq grease--clipboard
-                (list :paths (list path)
-                      :names (list name)
-                      :types (list type)
-                      :ids   (list id)
-                      :original-dir grease--root-dir
-                      :operation 'cut))
+    ;; Tell on-evil-yank to ignore the upcoming yank from delete.
+    (setq grease--pending-cut t)
 
-          ;; Remember that the last op is a CUT so yank won't clobber clipboard
-          (setq grease--last-op-type 'cut)
-          (setq grease--last-kill-index 0)
+    (cond
+     ;; Visual line/block cut of multiple entries
+     ((and (boundp 'evil-state)
+           (eq evil-state 'visual)
+           (memq (evil-visual-type) '(line block)))
+      (let ((names '()) (types '()) (ids '()) (paths '()))
+        (save-excursion
+          (goto-char (region-beginning))
+          (let ((end (save-excursion (goto-char (region-end)) (line-end-position))))
+            (while (< (point) end)
+              (let ((data (grease--get-line-data)))
+                (when data
+                  (let* ((name (plist-get data :name))
+                         (type (plist-get data :type))
+                         (id   (plist-get data :id))
+                         (path (grease--get-full-path name)))
+                    (push name names)
+                    (push type types)
+                    (push id ids)
+                    (push path paths)
+                    (when id (grease--mark-file-deleted id path)))))
+              (forward-line 1))))
+        (setq grease--clipboard
+              (list :paths (nreverse paths)
+                    :names (nreverse names)
+                    :types (nreverse types)
+                    :ids   (nreverse ids)
+                    :original-dir grease--root-dir
+                    :operation 'cut))
+        (setq grease--last-op-type 'cut)
+        (setq grease--last-kill-index 0)
+        (setq grease--buffer-dirty-p t)
+        (message "Cut (staged): %d item%s"
+                 (length names) (if (= (length names) 1) "" "s"))))
 
-          ;; Mark file as deleted in registry
-          (when id
-            (grease--mark-file-deleted id path))
+     ;; Single-line cut
+     (t
+      (let ((data (grease--get-line-data)))
+        (when data
+          (let* ((name (plist-get data :name))
+                 (type (plist-get data :type))
+                 (path (grease--get-full-path name))
+                 (id   (plist-get data :id)))
+            (setq grease--clipboard
+                  (list :paths (list path)
+                        :names (list name)
+                        :types (list type)
+                        :ids   (list id)
+                        :original-dir grease--root-dir
+                        :operation 'cut))
+            (setq grease--last-op-type 'cut)
+            (setq grease--last-kill-index 0)
+            (when id (grease--mark-file-deleted id path))
+            (setq grease--buffer-dirty-p t)
+            (message "Cut (staged): %s" name))))))))
 
-          ;; Important: mark buffer dirty so save picks it up
-          (setq grease--buffer-dirty-p t)
-
-          (message "Cut (staged): %s" name))))))
 
 (defun grease--after-evil-delete (&rest _)
-  "Handle operations after a delete action completes."
-  (when (and (derived-mode-p 'grease-mode) 
-             grease--deleted-selection)
-    ;; Restore the operation type to ensure paste works
-    (setq grease--last-op-type 'file)
-    (setq grease--last-kill-index 0)
-    ;; Clear the saved selection (but keep clipboard data)
-    (setq grease--deleted-selection nil)))
+  "Cleanup after delete. Nothing to restore if we ignored the yank."
+  (when (derived-mode-p 'grease-mode)
+    ;; Safety: ensure the flag isn't left set if Evil didn't yank for some reason.
+    (setq grease--pending-cut nil)))
 
 ;; Track the last yanked text to handle paste properly
 (defvar grease--last-yanked-text nil
