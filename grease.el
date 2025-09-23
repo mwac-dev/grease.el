@@ -238,7 +238,7 @@ IS-DUPLICATE indicates if this is a copy of another file."
     (when grease--use-icons
       (let* ((icon-start (point))
              (icon (grease--get-icon display-name)))
-        (insert icon)
+        (insert icon "  ")   ;; added two extra spaces after icon
         (put-text-property icon-start (point) 'grease-icon t)))
 
     ;; Insert the visible filename
@@ -302,36 +302,33 @@ IS-DUPLICATE indicates if this is a copy of another file."
 
     ;; Place point on first usable line (below header)
     (goto-char (point-min))
-    (forward-line 1)))
+    (forward-line 1)
+    (grease--constrain-cursor)))
 
 ;;;; Cursor Control and Evil Integration
 
 (defun grease--constrain-cursor ()
-  "Ensure cursor is positioned after the file prefix and icon."
+  "Ensure cursor is positioned after the hidden ID, icon, and trailing space."
   (when (and (derived-mode-p 'grease-mode)
-             (not (= (line-number-at-pos) 1))) ; Skip header line
-    (let ((pos (point))
-          (bol (line-beginning-position))
-          (prefix-end nil))
-
-      ;; If this is an editable blank line, allow cursor anywhere
+             (> (line-number-at-pos) 1)) ; skip header
+    (let ((bol (line-beginning-position))
+          (pos (point))
+          prefix-end)
       (unless (get-text-property bol 'grease-editable)
-        ;; Find the end of the prefix (ID + icon)
         (save-excursion
+          ;; skip hidden ID
           (goto-char bol)
-          (if (re-search-forward (concat grease--id-prefix "[0-9]+\\s") (line-end-position) t)
-              (setq prefix-end (point))
-            (setq prefix-end bol)))
+          (when (re-search-forward (concat grease--id-prefix "[0-9]+\\s-+") (line-end-position) t)
+            (setq prefix-end (point))))
 
-        ;; If icon exists, move past it too
-        (when (and prefix-end (> prefix-end bol))
-          (save-excursion
-            (goto-char prefix-end)
-            (while (and (< prefix-end (line-end-position))
-                        (get-text-property prefix-end 'grease-icon))
-              (setq prefix-end (1+ prefix-end)))))
+        ;; if we land inside icon+space, jump past it
+        (while (and (< (point) (line-end-position))
+                    (get-text-property (point) 'grease-icon))
+          (forward-char))
+        (when (and prefix-end (< prefix-end (point)))
+          (setq prefix-end (point)))
 
-        ;; Move cursor if it's before the filename part
+        ;; clamp if cursor is left of safe zone
         (when (and prefix-end (< pos prefix-end))
           (goto-char prefix-end))))))
 
