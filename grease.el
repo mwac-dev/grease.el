@@ -852,26 +852,32 @@ Runs BEFORE Evil's delete (which will also yank)."
       (setq grease--buffer-dirty-p t))))
 
 ;;;; Change Calculation (Diff Engine)
+(defun grease--relative-path (path)
+  "Return PATH relative to `grease--root-dir', or PATH if outside."
+  (let ((rel (file-relative-name path grease--root-dir)))
+    (if (string-prefix-p "../" rel)
+        path
+      rel)))
 
 (defun grease--format-change (change)
   "Format CHANGE for display in confirmation prompt."
   (pcase change
     (`(:create ,path)
-     (format "  [Create] %s" (file-name-nondirectory path)))
+     (format "  [Create] %s" (grease--relative-path path)))
     (`(:delete ,path)
-     (format "  [Delete] %s" (file-name-nondirectory path)))
+     (format "  [Delete] %s" (grease--relative-path path)))
     (`(:rename ,old ,new)
      (format "  [Rename] %s -> %s"
-             (file-name-nondirectory old)
-             (file-name-nondirectory new)))
+             (grease--relative-path old)
+             (grease--relative-path new)))
     (`(:move ,src ,dst)
      (format "  [Move]   %s -> %s"
-             (file-name-nondirectory src)
-             (file-name-nondirectory dst)))
+             (grease--relative-path src)
+             (grease--relative-path dst)))
     (`(:copy ,src ,dst)
      (format "  [Copy]   %s -> %s"
-             (file-name-nondirectory src)
-             (file-name-nondirectory dst)))))
+             (grease--relative-path src)
+             (grease--relative-path dst)))))
 
 (defun grease--detect-name-conflicts (entries)
   "Check for duplicate filenames that aren't marked as duplicates in ENTRIES."
@@ -1083,12 +1089,23 @@ Returns a list of rename operations to be performed."
   (let ((changes (grease--calculate-changes)))
     (if (not changes)
         (message "Grease: No changes to save.")
-      (if (y-or-n-p (format "Apply these changes?\n%s\n" (mapconcat #'grease--format-change changes "\n")))
-          (progn
-            (grease--apply-changes changes)
-            (grease--render grease--root-dir)
-            t)
-        (message "Grease: Save cancelled.") nil))))
+      (let* ((prompt (format "Apply these changes? (y=yes, n=cancel, d=discard)\n%s\n"
+                             (mapconcat #'grease--format-change changes "\n")))
+             (choice (read-char-choice prompt '(?y ?n ?d))))
+        (pcase choice
+          (?y
+           (grease--apply-changes changes)
+           (grease--render grease--root-dir)
+           t)
+          (?d
+           (setq grease--pending-changes nil
+                 grease--clipboard nil
+                 grease--buffer-dirty-p nil)
+           (clrhash grease--deleted-file-ids)
+           (grease--render grease--root-dir)
+           (message "Grease: Discarded all pending changes.")
+           t)
+          (_ (message "Grease: Save cancelled.") nil))))))
 
 (defun grease-duplicate-line ()
   "Duplicate the current line."
@@ -1269,11 +1286,25 @@ Returns a list of rename operations to be performed."
     (message "Grease: Refreshed.")))
 
 (defun grease-quit ()
-  "Quit the grease buffer, prompting to save changes."
+  "Quit the grease buffer, prompting to save or discard changes."
   (interactive)
   (if (or grease--buffer-dirty-p grease--pending-changes)
-      (when (y-or-n-p "Save changes before quitting?")
-        (grease-save))
+      (let* ((changes (grease--calculate-changes))
+             (prompt (format "Save changes before quitting? (y=yes, n=cancel, d=discard)\n%s\n"
+                             (mapconcat #'grease--format-change changes "\n")))
+             (choice (read-char-choice prompt '(?y ?n ?d))))
+        (pcase choice
+          (?y
+           (grease-save)
+           (kill-buffer (current-buffer)))
+          (?d
+           (setq grease--pending-changes nil
+                 grease--clipboard nil
+                 grease--buffer-dirty-p nil)
+           (clrhash grease--deleted-file-ids)
+           (kill-buffer (current-buffer))
+           (message "Grease: Discarded changes and quit."))
+          (_ (message "Quit cancelled."))))
     (kill-buffer (current-buffer))))
 
 ;;;; Major Mode Definition
