@@ -5,13 +5,6 @@
 ;; You edit a directory listing as if it were a normal text file using
 ;; standard Evil (or Emacs) commands, then commit your changes to the filesystem.
 ;;
-;; - Edit a filename to rename it (`ciw`).
-;; - Delete a line to delete the file (`dd`).
-;; - Create a file by adding a new line (`o`, `O`). End with "/" for a directory.
-;; - Copy/paste lines to copy files (`yy`, `p`).
-;; - Cut/paste lines to move files (`dd`, `p`).
-;; - Use visual mode to select and edit multiple lines at once.
-;;
 ;; Changes are staged until you save with `grease-save` (C-c C-s), or when
 ;; prompted before actions like visiting a file (`RET`) or quitting (`q`).
 
@@ -269,53 +262,45 @@ IS-DUPLICATE indicates if this is a copy of another file."
 (defun grease--render (dir &optional keep-changes)
   "Render the contents of DIR into the current buffer."
   (let ((inhibit-read-only t)
-        (inhibit-modification-hooks t)
-        (next-id 1))
-    ;; Make sure the buffer is not read-only
+        (inhibit-modification-hooks t))
     (setq buffer-read-only nil)
-
-    ;; Register the directory in our visited directories list
     (setq grease--root-dir (file-name-as-directory (expand-file-name dir)))
     (grease--register-directory grease--root-dir)
-
-    ;; Setup buffer state
     (erase-buffer)
     (setq grease--original-state (make-hash-table :test 'equal))
-
-    ;; Clear pending changes if not keeping them
     (unless keep-changes
       (setq grease--pending-changes nil))
-
     (setq grease--buffer-dirty-p nil)
 
-    ;; Insert header
-    (let ((header-start (point)))
-      (insert (format " Greasy Fork — %s\n" grease--root-dir))
-      (add-text-properties header-start (point)
-                           '(read-only t front-sticky nil face mode-line-inactive)))
+    ;; Header line
+(let ((header-start (point)))
+  ;; Insert header text only (no newline yet)
+  (insert (format " Grease — %s" grease--root-dir))
+  (add-text-properties header-start (point)
+                       '(read-only t front-sticky nil face mode-line-inactive))
+  ;; Now insert a normal newline (not read-only)
+  (insert "\n"))
 
-    ;; Insert files
+    ;; Files (if any)
     (let* ((all-files (directory-files grease--root-dir nil nil t))
            (files (cl-remove-if (lambda (f) (member f '("." ".."))) all-files)))
       (dolist (file (sort files #'string<))
         (let* ((abs-path (expand-file-name file grease--root-dir))
-         (type (if (file-directory-p abs-path) 'dir 'file))
-         (existing-id (grease--get-id-by-path abs-path)))
-    ;; Skip files that were cut (deleted but not yet saved)
-    (unless (and existing-id
-                 (gethash existing-id grease--deleted-file-ids))
-      ;; Record original state
-      (puthash file type grease--original-state)
-      ;; Insert entry
-      (grease--insert-entry
-       (or existing-id (cl-incf grease--session-id-counter))
-       file type nil nil)))))
-    ;; Always add an empty editable line at the end for adding new files
+               (type (if (file-directory-p abs-path) 'dir 'file))
+               (existing-id (grease--get-id-by-path abs-path)))
+          (unless (and existing-id
+                       (gethash existing-id grease--deleted-file-ids))
+          (puthash (grease--normalize-name file type) type grease--original-state)
+            (grease--insert-entry
+             (or existing-id (cl-incf grease--session-id-counter))
+             file type nil nil)))))
+
+    ;; Always add one editable line after files (or after header if empty)
     (let ((start (point)))
       (insert "\n")
-      ;; Mark this line as specially editable
       (put-text-property start (point) 'grease-editable t))
 
+    ;; Place point on first usable line (below header)
     (goto-char (point-min))
     (forward-line 1)))
 
@@ -676,7 +661,7 @@ Runs BEFORE Evil's delete (which will also yank)."
   "Intercept paste commands to use grease-paste when appropriate."
   (if (and (derived-mode-p 'grease-mode)
            ;; Only use grease-paste when:
-           (memq grease--last-op-type '(file cut))  ;; Last op was a file or cut operation
+           (memq grease--last-op-type '(file cut copy))  ;; Last op was a file or cut operation
            (eq grease--last-kill-index 0)   ;; Current kill is the most recent
            grease--clipboard)               ;; We have clipboard data
       ;; Use grease-paste for file operations
@@ -727,8 +712,8 @@ Runs BEFORE Evil's delete (which will also yank)."
                                   line-beg line-end))
                    (clean-text (grease--extract-filename visible-text))
                    (is-dir (grease--is-dir-name clean-text))
-                   (name (grease--strip-trailing-slash clean-text))
-                   (type (if is-dir 'dir 'file))
+                  (name (grease--normalize-name clean-text (if is-dir 'dir 'file)))
+                  (type (if is-dir 'dir 'file))
                    (full-path (grease--get-full-path name)))
 
               ;; Update text properties with new name
@@ -773,7 +758,7 @@ Runs BEFORE Evil's delete (which will also yank)."
 
                 ;; Insert the formatted entry
                 (grease--insert-entry next-id
-                                     (grease--strip-trailing-slash file-name)
+                                     (grease--normalize-name file-name type)
                                      type)
 
                 ;; Add a new editable line if needed
