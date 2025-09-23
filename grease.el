@@ -450,17 +450,46 @@ IS-DUPLICATE indicates if this is a copy of another file."
 (defvar grease--pending-cut nil
   "Non-nil when a cut operation is in progress (before evil’s implicit yank).")
 
-(defun grease--on-evil-yank (_beg _end &rest _)
+(defun grease--on-evil-yank (beg end &rest _)
+  "Intercept Evil yanks in grease-mode.
+Handles both multi-line visual yanks and single-line `yy` yanks."
   (when (derived-mode-p 'grease-mode)
     (if grease--pending-cut
-        ;; Ignore the yank that Evil does as part of delete
+        ;; Ignore the yank Evil does as part of delete
         (setq grease--pending-cut nil)
-      ;; Real yank (yy/Vy): record as copy
-      (grease--mark-as-grease-op)
-      (if grease--multi-line-selection
-          (setq grease--clipboard
-                (append grease--multi-line-selection (list :operation 'copy)))
-        (let ((data (grease--get-line-data)))
+      (cond
+       ;; Multi-line visual yank
+       ((and (boundp 'evil-state)
+             (eq evil-state 'visual)
+             (memq (evil-visual-type) '(line block)))
+        (let ((names '()) (types '()) (ids '()) (paths '()))
+          (save-excursion
+            (goto-char beg)
+            (while (< (point) end)
+              (let ((data (grease--get-line-data)))
+                (when data
+                  (push (plist-get data :name) names)
+                  (push (plist-get data :type) types)
+                  (push (plist-get data :id) ids)
+                  (push (grease--get-full-path (plist-get data :name)) paths)))
+              (forward-line 1)))
+          (when names
+            (setq grease--clipboard
+                  (list :paths (nreverse paths)
+                        :names (nreverse names)
+                        :types (nreverse types)
+                        :ids (nreverse ids)
+                        :original-dir grease--root-dir
+                        :operation 'copy))
+            (setq grease--last-op-type 'file
+                  grease--last-kill-index 0
+                  grease--multi-line-selection nil)
+            (message "Copied %d item%s"
+                     (length names) (if (= (length names) 1) "" "s")))))
+
+       ;; Single-line yank (`yy` or evil-yank-line)
+       (t
+        (let ((data (grease--get-line-data beg)))
           (when data
             (let* ((name (plist-get data :name))
                    (type (plist-get data :type))
@@ -470,10 +499,13 @@ IS-DUPLICATE indicates if this is a copy of another file."
                     (list :paths (list path)
                           :names (list name)
                           :types (list type)
-                          :ids   (list id)
+                          :ids (list id)
                           :original-dir grease--root-dir
                           :operation 'copy))
-              (message "Copied file: %s" name))))))))
+              (setq grease--last-op-type 'file
+                    grease--last-kill-index 0
+                    grease--multi-line-selection nil)
+              (message "Copied file: %s" name)))))))))
 
 (defun grease--before-evil-delete (&rest _)
   "Collect files about to be deleted and stage a CUT clipboard.
