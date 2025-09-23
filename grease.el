@@ -84,6 +84,12 @@ Each entry is keyed by unique ID and contains:
 (defvar-local grease--pending-changes nil
   "List of pending file operations in current buffer.")
 
+;; last directory and line number visited for cursor position persistence
+(defvar grease--last-dir nil
+  "The last directory visited in Grease.")
+(defvar grease--last-line 1
+  "The last line number visited in Grease (relative to buffer).")
+
 ;; Prefixes for hidden IDs
 (defconst grease--id-prefix "/"
   "Prefix for hidden file IDs.")
@@ -259,6 +265,25 @@ IS-DUPLICATE indicates if this is a copy of another file."
 
     (insert "\n")))
 
+
+(defun grease--save-position ()
+  "Save last visited directory and line number."
+  (when grease--root-dir
+    (setq grease--last-dir grease--root-dir)
+    (setq grease--last-line (line-number-at-pos))))
+
+
+(defun grease--restore-position ()
+  "Restore point to the last saved line for this directory, or fallback."
+  (let ((target-line (max 2 grease--last-line))) ;; never before header
+    (goto-char (point-min))
+    (forward-line (1- target-line))
+    ;; clamp if buffer is shorter
+    (when (>= (point) (point-max))
+      (goto-char (point-min))
+      (forward-line 1)))
+  (grease--constrain-cursor))
+
 (defun grease--render (dir &optional keep-changes)
   "Render the contents of DIR into the current buffer."
   (let ((inhibit-read-only t)
@@ -299,11 +324,8 @@ IS-DUPLICATE indicates if this is a copy of another file."
     (let ((start (point)))
       (insert "\n")
       (put-text-property start (point) 'grease-editable t))
+      (grease--restore-position)))
 
-    ;; Place point on first usable line (below header)
-    (goto-char (point-min))
-    (forward-line 1)
-    (grease--constrain-cursor)))
 
 ;;;; Cursor Control and Evil Integration
 
@@ -1238,6 +1260,7 @@ Returns a list of rename operations to be performed."
 (defun grease-visit ()
   "Visit the file or directory at point."
   (interactive)
+  (grease--save-position)
   (let ((data (grease--get-line-data)))
     (if (not data)
         (user-error "Not on a file or directory line.")
@@ -1261,6 +1284,7 @@ Returns a list of rename operations to be performed."
 (defun grease-up-directory ()
   "Move to the parent directory."
   (interactive)
+  (grease--save-position)
   (let ((parent-dir (expand-file-name ".." grease--root-dir)))
     ;; Store any changes before moving
     (when grease--buffer-dirty-p
@@ -1286,6 +1310,7 @@ Returns a list of rename operations to be performed."
 (defun grease-quit ()
   "Quit the grease buffer, prompting to save or discard changes."
   (interactive)
+  (grease--save-position)
   (if (or grease--buffer-dirty-p grease--pending-changes)
       (let* ((changes (grease--calculate-changes))
              (prompt (format "Save changes before quitting? (y=yes, n=cancel, d=discard)\n%s\n"
@@ -1349,11 +1374,21 @@ Returns a list of rename operations to be performed."
 
 ;;;###autoload
 (defun grease-toggle ()
-  "Toggle between current buffer and Grease for the current directory."
+  "Toggle between current buffer and Grease for the last directory."
   (interactive)
   (if (derived-mode-p 'grease-mode)
-      (grease-quit)
-    (grease-open default-directory)))
+      (progn
+        (grease--save-position)
+        (grease-quit))
+    (let* ((dir (if (and grease--last-dir (file-directory-p grease--last-dir))
+                    grease--last-dir
+                  default-directory))
+           (bufname (format "*grease: %s*" dir))
+           (buf (get-buffer bufname)))
+      (if buf
+          (switch-to-buffer buf)
+        (grease-open dir))
+      (grease--restore-position))))
 
 ;;;###autoload
 (defun grease-here ()
