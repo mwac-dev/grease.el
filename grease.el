@@ -879,22 +879,21 @@ Runs BEFORE Evil's delete (which will also yank)."
              (grease--relative-path src)
              (grease--relative-path dst)))))
 
+
+
 (defun grease--detect-name-conflicts (entries)
-  "Check for duplicate filenames that aren't marked as duplicates in ENTRIES."
+  "Check for duplicate filenames in the same directory.
+Return a list of conflicting names."
   (let ((names (make-hash-table :test 'equal))
         (conflicts '()))
-
     (dolist (entry entries)
-      (let* ((name (plist-get entry :name))
-             (is-duplicate (plist-get entry :is-duplicate)))
-        ;; Only count non-duplicates for conflict detection
-        (unless is-duplicate
-          (let ((count (gethash name names 0)))
-            (when (> count 0)
-              (push name conflicts))
-            (puthash name (1+ count) names)))))
-
-    conflicts))
+      (let ((name (plist-get entry :name)))
+        (let ((count (gethash name names 0)))
+          (when (> count 0)
+            ;; second time we see this exact name → conflict
+            (push name conflicts))
+          (puthash name (1+ count) names))))
+    (cl-remove-duplicates conflicts :test #'equal)))
 
 (defun grease--check-for-renames (new-entries original-state)
   "Detect file renames by comparing NEW-ENTRIES with ORIGINAL-STATE.
@@ -935,12 +934,14 @@ Returns a list of rename operations to be performed."
          (original-files (copy-hash-table grease--original-state))
          (seen-originals (make-hash-table :test 'equal))
          (seen-ids (make-hash-table :test 'eql))
+         ;; detect conflicts first
          (name-conflicts (grease--detect-name-conflicts entries))
          (renames (grease--check-for-renames entries original-files)))
 
-    ;; Check for naming conflicts
+    ;; Abort immediately if name conflicts exist
     (when name-conflicts
-      (user-error "Filename conflicts detected: %s" (mapconcat #'identity name-conflicts ", ")))
+      (user-error "Filename conflicts detected in this directory: %s"
+                  (mapconcat #'identity name-conflicts ", ")))
 
     ;; Add detected renames to changes
     (setq changes (append renames changes))
