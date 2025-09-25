@@ -85,16 +85,29 @@ Each entry is keyed by unique ID and contains:
   "List of pending file operations in current buffer.")
 
 ;; last directory and line number visited for cursor position persistence
-(defvar grease--last-dir nil
-  "The last directory visited in Grease.")
-(defvar grease--last-line 1
-  "The last line number visited in Grease (relative to buffer).")
+(defvar grease--project-positions (make-hash-table :test 'equal)
+  "Map project root -> plist of (:dir DIR :line LINE).")
 
 ;; Prefixes for hidden IDs
 (defconst grease--id-prefix "/"
   "Prefix for hidden file IDs.")
 
 ;;;; Registry Functions
+
+(defun grease--project-root ()
+  "Return the root directory of the current project, or `default-directory`."
+  (cond
+   ((fboundp 'project-current)
+    (when-let ((proj (project-current nil)))
+      (car (project-roots proj))))
+   ((fboundp 'projectile-project-root)
+    (ignore-errors (projectile-project-root)))
+   (t default-directory)))
+
+
+(defun grease--project-name ()
+  "Return a short name for the current project root."
+  (file-name-nondirectory (directory-file-name (grease--project-root))))
 
 (defun grease--register-file (path type &optional id)
   "Register PATH of TYPE in registry and return its ID.
@@ -267,22 +280,29 @@ IS-DUPLICATE indicates if this is a copy of another file."
 
 
 (defun grease--save-position ()
-  "Save last visited directory and line number."
+  "Save last visited directory and line for the current project."
   (when grease--root-dir
-    (setq grease--last-dir grease--root-dir)
-    (setq grease--last-line (line-number-at-pos))))
+    (let ((proj (grease--project-root)))
+      (puthash proj
+               (list :dir grease--root-dir
+                     :line (line-number-at-pos))
+               grease--project-positions))))
 
 
 (defun grease--restore-position ()
-  "Restore point to the last saved line for this directory, or fallback."
-  (let ((target-line (max 2 grease--last-line))) ;; never before header
-    (goto-char (point-min))
-    (forward-line (1- target-line))
-    ;; clamp if buffer is shorter
-    (when (>= (point) (point-max))
+  "Restore last visited directory and line for the current project."
+  (let* ((proj (grease--project-root))
+         (state (gethash proj grease--project-positions)))
+    (if state
+        (progn
+          (grease--render (plist-get state :dir) t)
+          (goto-char (point-min))
+          (forward-line (max 1 (1- (or (plist-get state :line) 1))))
+          (grease--constrain-cursor))
+      ;; fallback if no saved state
       (goto-char (point-min))
-      (forward-line 1)))
-  (grease--constrain-cursor))
+      (forward-line 1)
+      (grease--constrain-cursor))))
 
 (defun grease--render (dir &optional keep-changes)
   "Render the contents of DIR into the current buffer."
@@ -298,15 +318,13 @@ IS-DUPLICATE indicates if this is a copy of another file."
     (setq grease--buffer-dirty-p nil)
 
     ;; Header line
-(let ((header-start (point)))
-  ;; Insert header text only (no newline yet)
-  (insert (format " Grease — %s" grease--root-dir))
-  (add-text-properties header-start (point)
-                       '(read-only t front-sticky nil face mode-line-inactive))
-  ;; Now insert a normal newline (not read-only)
-  (insert "\n"))
+    (let ((header-start (point)))
+      (insert (format " Grease — %s" grease--root-dir))
+      (add-text-properties header-start (point)
+                           '(read-only t front-sticky nil face mode-line-inactive))
+      (insert "\n"))
 
-    ;; Files (if any)
+    ;; Files
     (let* ((all-files (directory-files grease--root-dir nil nil t))
            (files (cl-remove-if (lambda (f) (member f '("." ".."))) all-files)))
       (dolist (file (sort files #'string<))
@@ -315,16 +333,15 @@ IS-DUPLICATE indicates if this is a copy of another file."
                (existing-id (grease--get-id-by-path abs-path)))
           (unless (and existing-id
                        (gethash existing-id grease--deleted-file-ids))
-          (puthash (grease--normalize-name file type) type grease--original-state)
+            (puthash (grease--normalize-name file type) type grease--original-state)
             (grease--insert-entry
              (or existing-id (cl-incf grease--session-id-counter))
              file type nil nil)))))
 
-    ;; Always add one editable line after files (or after header if empty)
+    ;; Always add one editable line at the end
     (let ((start (point)))
       (insert "\n")
-      (put-text-property start (point) 'grease-editable t))
-      (grease--restore-position)))
+      (put-text-property start (point) 'grease-editable t))))
 
 
 ;;;; Cursor Control and Evil Integration
@@ -1394,46 +1411,50 @@ Returns a list of rename operations to be performed."
 
 ;;;###autoload
 (defun grease-open (dir)
-  "Open a Grease buffer for DIR in full window."
+  "Open a Grease buffer for DIR, reusing the project’s Grease buffer.
+Restores last position if available."
   (interactive "DGrease directory: ")
-  (let* ((dir (file-name-as-directory (expand-file-name dir)))
-         (bufname (format "*grease: %s*" dir))
-         (buf (get-buffer-create bufname)))
-    (with-current-buffer buf
+  (let* ((proj-root (file-name-as-directory (expand-file-name (grease--project-root))))
+         (proj-name (grease--project-name))
+         (bufname   (format "*grease:%s*" proj-name)))
+    (with-current-buffer (get-buffer-create bufname)
       (grease-mode)
-      (grease--render dir))
-    (switch-to-buffer buf)))
+      (setq grease--root-dir proj-root)
+      ;; Restore if we have saved state, otherwise render fresh
+      (if (gethash proj-root grease--project-positions)
+          (grease--restore-position)
+        (grease--render dir)))
+    (switch-to-buffer bufname)))
 
 ;;;###autoload
 (defun grease-toggle ()
-  "Toggle between current buffer and Grease for the last directory."
+  "Toggle Grease buffer for the current project.
+If already open, quit (saving position). Otherwise restore last position if available."
   (interactive)
-  (if (derived-mode-p 'grease-mode)
-      (progn
-        (grease--save-position)
-        (grease-quit))
-    (let* ((dir (if (and grease--last-dir (file-directory-p grease--last-dir))
-                    grease--last-dir
-                  default-directory))
-           (bufname (format "*grease: %s*" dir))
-           (buf (get-buffer bufname)))
-      (if buf
-          (switch-to-buffer buf)
-        (grease-open dir))
-      (grease--restore-position))))
+  (let* ((proj-root (file-name-as-directory (expand-file-name (grease--project-root))))
+         (proj-name (grease--project-name))
+         (bufname   (format "*grease:%s*" proj-name)))
+    (if (and (derived-mode-p 'grease-mode)
+             (string= (buffer-name) bufname))
+        (grease-quit)
+      (if-let ((buf (get-buffer bufname)))
+          (switch-to-buffer buf) ;; reuse existing buffer
+        (grease-open default-directory)))))
 
 ;;;###autoload
 (defun grease-here ()
-  "Open Grease for the current directory, or quit if already in a Grease buffer."
+  "Open Grease buffer for the current project’s root.
+If already open, quit (saving position). Otherwise restore last position if available."
   (interactive)
-  (if (derived-mode-p 'grease-mode)
-      (grease-quit)
-    (let* ((dir (file-name-as-directory default-directory))
-           (bufname (format "*grease: %s*" dir))
-           (buf (get-buffer bufname)))
-      (if buf
+  (let* ((proj-root (file-name-as-directory (expand-file-name (grease--project-root))))
+         (proj-name (grease--project-name))
+         (bufname   (format "*grease:%s*" proj-name)))
+    (if (and (derived-mode-p 'grease-mode)
+             (string= (buffer-name) bufname))
+        (grease-quit)
+      (if-let ((buf (get-buffer bufname)))
           (switch-to-buffer buf)
-        (grease-open dir)))))
+        (grease-open proj-root)))))
 
 ;; Integrate with save-buffer
 (defun grease-advice-save-buffer (orig-fun &rest args)
