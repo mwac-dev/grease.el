@@ -1,0 +1,166 @@
+#+TITLE: Grease.el — Oil.nvim-Style File Manager for Emacs
+#+AUTHOR: MWAC-dev
+#+OPTIONS: toc:nil num:nil
+#+PROPERTY: header-args:emacs-lisp :mkdirp yes
+
+* Introduction
+
+** About Grease.el
+Grease is a *“writable buffer first”* file manager for Emacs, inspired by [[https://github.com/stevearc/oil.nvim][oil.nvim]].
+It’s not meant to replace dired/wdired or dirvish (both are fantastic!), but to offer
+an alternate workflow for file and directory management.
+
+Grease turns a directory listing into a buffer you can edit like text:
+rename, delete, yank, paste, or create files with normal Emacs/Evil motions,
+then commit your edits to the filesystem.
+
+** Why make this?
+After years of loving Neovim, curiosity eventually pulled me into Emacs.
+I’ve been using Doom Emacs for just a few days, and I noticed that everything
+from my highly customized LazyVim setup was already here… except one thing:
+the brilliant *oil.nvim*.
+
+I tried dired and wdired, and while they work, they didn’t feel as fast as oil.
+Dirvish is gorgeous but again, a different style.
+So, instead of giving up, I decided to build my own take. Part of this was to
+finally learn some Lisp (my first time!), and part was to make the Emacs
+experience a bit more familiar for fellow Neovim users exploring this world.
+
+* Installation
+Clone this repo somewhere on your load path (e.g. =~/.config/doom/lisp/=):
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "~/.config/doom/lisp/grease")
+(require 'grease)
+#+end_src
+
+* Usage
+
+** Opening Grease
+Open a directory with:
+
+#+begin_src emacs-lisp
+M-x grease-open RET ~/projects/
+#+end_src
+
+This creates a buffer named ~*grease:project-name*~ with a header line
+and the directory contents.
+
+- ~M-x grease-toggle~ :: Toggle Grease for the current project.
+- ~M-x grease-here~ :: Open Grease directly at the project root.
+
+** Editing Operations
+Each line after the header represents a file or directory.
+
+- *Rename*: move to a filename, edit it, save.
+- *Delete*: delete a line with ~dd~.
+- *Create*: add a new line with ~o~, type a name, save.
+  - End with "/" to make a directory.
+- *Copy*: yank a line with ~yy~, paste with ~p~.
+- *Move*: cut with ~dd~, paste elsewhere with ~p~.
+- *Duplicate*: duplicate a line with ~C-c C-d~.
+- *Multi-file*: visual select (~Vjjj~) then yank or delete.
+
+When ready, commit changes with:
+
+#+begin_src emacs-lisp
+C-c C-s
+;; or
+:w
+#+end_src
+
+** Example Session
+
+Before editing:
+#+begin_example
+ Grease — ~/docs/
+
+ 001 📄 notes.org
+ 002 📁 drafts/
+ 003 📄 todo.txt
+#+end_example
+
+After editing:
+#+begin_example
+ Grease — ~/docs/
+
+ 001 📄 notes.org
+ 002 📁 drafts/
+ 003 📄 todo.txt
+ 004 📁 newdir/
+ 005 📄 report.md
+#+end_example
+
+On save:
+- ~newdir/~ will be created.
+- ~report.md~ will be created.
+
+* Commands
+Grease provides the following entrypoints:
+
+- ~M-x grease-open~ :: Open a Grease buffer for a directory.
+- ~M-x grease-toggle~ :: Toggle Grease for the current project.
+- ~M-x grease-here~ :: Open Grease at the project root.
+- ~M-x grease-save~ :: Save all staged changes to disk.
+- ~M-x grease-visit~ :: Visit the file or enter a directory at point.
+- ~M-x grease-up-directory~ :: Move to the parent directory.
+- ~M-x grease-refresh~ :: Discard staged changes and reload from disk.
+- ~M-x grease-quit~ :: Quit Grease, prompting to save/discard staged changes.
+- ~M-x grease-duplicate-line~ :: Duplicate the file/directory at point.
+- ~M-x grease-cut~ :: Stage a cut (move).
+- ~M-x grease-copy~ :: Stage a copy.
+- ~M-x grease-paste~ :: Paste from clipboard into current directory.
+- ~M-x grease-reset-registry~ :: Reset Grease’s global file registry.
+- ~M-x grease-debug-state~ :: Debug view of registry and clipboard.
+
+* Keybinds
+Here’s a Doom-style setup:
+
+#+begin_src emacs-lisp
+(map! :leader
+      (:prefix ("o g" . "Grease")
+       :desc "Open Grease (current dir)" "o" #'grease-open
+       :desc "Toggle Grease"             "t" #'grease-toggle
+       :desc "Open Grease at project"    "h" #'grease-here
+       :desc "Save Grease changes"       "s" #'grease-save
+       :desc "Refresh Grease buffer"     "r" #'grease-refresh
+       :desc "Quit Grease"               "q" #'grease-quit))
+#+end_src
+
+Inside ~grease-mode~:
+- ~RET~ → visit file or enter directory
+- ~-~ → go up one directory
+- ~gr~ → refresh buffer
+- ~C-c C-s~ → save staged changes
+- ~C-c C-d~ → duplicate line
+- ~C-c C-x~ → cut
+- ~C-c C-c~ → copy
+- ~C-c C-v~ → paste
+
+* Feature Checklist
+
+** Implemented
+- [X] View and edit directories as writable buffers.
+- [X] Rename files by editing text.
+- [X] Delete files by deleting lines.
+- [X] Create files by typing into the editable line.
+- [X] Create directories by ending a name with “/”.
+- [X] Copy/paste files across directories (~yy/p~).
+- [X] Move files with cut/paste (~dd/p~).
+- [X] Multi-line yank/delete in visual mode.
+- [X] Duplicate a line (~C-c C-d~).
+- [X] Cursor constraints (never get stuck in the hidden ID/icon column).
+- [X] Persistent cursor position per project.
+
+** Not Yet Implemented
+- [ ] Nested directory creation before commit  
+  Example: ~dir1/dir2/dir3/~ creates the full path.
+- [ ] Nested file creation in new directories  
+  Example: ~dir1/file.org~ creates ~dir1/~ and then ~file.org~ inside.
+- [ ] Undo/redo of staged changes (currently limited).
+- [ ] Tighter integration with dired/project.el (future possibility).
+
+* Disclaimer
+Grease is early and evolving. It makes *real changes on disk*.  
+Although it always asks for confirmation and tries to be careful, bugs are possible and *data loss could occur*.  
+Use at your own risk — and *always* with version control.
