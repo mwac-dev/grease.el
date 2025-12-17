@@ -1917,20 +1917,30 @@ If TARGET-FILE is provided, position cursor on it."
 (defun grease-toggle ()
   "Toggle Grease buffer for the current project.
 If already open, quit (saving position). Otherwise open in current directory.
+If called from a preview buffer, close the associated grease buffer.
 If the current directory does not exist, traverse up to find the first valid one."
   (interactive)
   (let* ((proj-root (file-name-as-directory (expand-file-name (grease--project-root))))
          (proj-name (grease--project-name))
          (bufname   (format "*grease:%s*" proj-name))
+         (preview-bufname (format "*grease-preview:%s*" proj-name))
          (start-dir (expand-file-name default-directory))
          (valid-dir start-dir))
+
+    ;; If we're in the preview buffer, switch to grease buffer and quit
+    (when (string= (buffer-name) preview-bufname)
+      (let ((grease-buf (get-buffer bufname)))
+        (when grease-buf
+          (switch-to-buffer grease-buf)
+          (grease-quit))
+        (cl-return-from grease-toggle)))
 
     ;; Find nearest existing parent directory
     (while (and (not (file-exists-p valid-dir))
                 (not (string= valid-dir "/"))
                 (not (string= (directory-file-name valid-dir) valid-dir))) ;; Break if no change
       (setq valid-dir (file-name-directory (directory-file-name valid-dir))))
-    
+
     (let ((target-file (if (string= start-dir valid-dir)
                            (when buffer-file-name (file-name-nondirectory buffer-file-name))
                          nil)))
