@@ -1102,9 +1102,11 @@ Returns a list of rename operations to be performed."
       (pcase change
         (`(:create ,path)
          (message "Grease: Creating %s" path)
-         (condition-case e (if (string-suffix-p "/" path)
-                             (make-directory path)
-                           (write-region "" nil path t)) ; 't' creates the file
+         (condition-case e 
+             (if (string-suffix-p "/" path)
+                 (make-directory path t)
+               (make-directory (file-name-directory path) t)
+               (write-region "" nil path t)) ; 't' creates the file
            (error (push (format "Failed to create %s: %s" path e) errors))))
 
         (`(:delete ,path)
@@ -1116,7 +1118,10 @@ Returns a list of rename operations to be performed."
 
         (`(:rename ,old-path ,new-path)
          (message "Grease: Renaming %s -> %s" old-path new-path)
-         (condition-case e (rename-file old-path new-path t)
+         (condition-case e 
+             (progn
+               (make-directory (file-name-directory new-path) t)
+               (rename-file old-path new-path t))
            (error (push (format "Failed to rename %s: %s" old-path e) errors))))
 
         (`(:copy ,src-path ,dst-path)
@@ -1124,15 +1129,18 @@ Returns a list of rename operations to be performed."
              (message "Grease: Skipping copy to same location %s" src-path)
            (message "Grease: Copying %s -> %s" src-path dst-path)
            (condition-case e
-               (if (file-directory-p src-path)
-                   (copy-directory src-path dst-path)
-                 (copy-file src-path dst-path t))
+               (progn
+                 (make-directory (file-name-directory dst-path) t)
+                 (if (file-directory-p src-path)
+                     (copy-directory src-path dst-path)
+                   (copy-file src-path dst-path t)))
              (error (push (format "Failed to copy %s: %s" src-path e) errors)))))
 
         (`(:move ,src-path ,dst-path)
          (message "Grease: Moving %s -> %s" src-path dst-path)
          (condition-case e
              (progn
+               (make-directory (file-name-directory dst-path) t)
                (if (file-directory-p src-path)
                    (copy-directory src-path dst-path)
                  (copy-file src-path dst-path t))
@@ -1409,42 +1417,75 @@ Returns a list of rename operations to be performed."
 
 ;;;; Entry Points
 
+(defun grease--goto-file (name)
+  "Move cursor to the line corresponding to file NAME."
+  (goto-char (point-min))
+  (let ((found nil))
+    (while (and (not found) (not (eobp)))
+      (let* ((line-data (grease--get-line-data))
+             (line-name (plist-get line-data :name)))
+        (when (and line-name (string= line-name name))
+          (setq found t))
+        (unless found
+          (forward-line 1))))
+    (if found
+        (grease--constrain-cursor)
+      ;; If not found, go to first file
+      (goto-char (point-min))
+      (forward-line 1)
+      (grease--constrain-cursor))))
+
 ;;;###autoload
-(defun grease-open (dir)
+(defun grease-open (dir &optional target-file)
   "Open a Grease buffer for DIR, reusing the project’s Grease buffer.
-Restores last position if available."
+If TARGET-FILE is provided, position cursor on it."
   (interactive "DGrease directory: ")
   (let* ((proj-root (file-name-as-directory (expand-file-name (grease--project-root))))
          (proj-name (grease--project-name))
          (bufname   (format "*grease:%s*" proj-name)))
     (with-current-buffer (get-buffer-create bufname)
       (grease-mode)
-      (setq grease--root-dir proj-root)
-      ;; Restore if we have saved state, otherwise render fresh
-      (if (gethash proj-root grease--project-positions)
-          (grease--restore-position)
-        (grease--render dir)))
+      ;; Always render the requested directory
+      (grease--render dir)
+      (if target-file
+          (grease--goto-file target-file)
+        ;; Default to top
+        (goto-char (point-min))
+        (forward-line 1)
+        (grease--constrain-cursor)))
     (switch-to-buffer bufname)))
 
 ;;;###autoload
 (defun grease-toggle ()
   "Toggle Grease buffer for the current project.
-If already open, quit (saving position). Otherwise restore last position if available."
+If already open, quit (saving position). Otherwise open in current directory.
+If the current directory does not exist, traverse up to find the first valid one."
   (interactive)
   (let* ((proj-root (file-name-as-directory (expand-file-name (grease--project-root))))
          (proj-name (grease--project-name))
-         (bufname   (format "*grease:%s*" proj-name)))
-    (if (and (derived-mode-p 'grease-mode)
-             (string= (buffer-name) bufname))
-        (grease-quit)
-      (if-let ((buf (get-buffer bufname)))
-          (switch-to-buffer buf) ;; reuse existing buffer
-        (grease-open default-directory)))))
+         (bufname   (format "*grease:%s*" proj-name))
+         (start-dir (expand-file-name default-directory))
+         (valid-dir start-dir))
+
+    ;; Find nearest existing parent directory
+    (while (and (not (file-exists-p valid-dir))
+                (not (string= valid-dir "/"))
+                (not (string= (directory-file-name valid-dir) valid-dir))) ;; Break if no change
+      (setq valid-dir (file-name-directory (directory-file-name valid-dir))))
+    
+    (let ((target-file (if (string= start-dir valid-dir)
+                           (when buffer-file-name (file-name-nondirectory buffer-file-name))
+                         nil)))
+
+      (if (and (derived-mode-p 'grease-mode)
+               (string= (buffer-name) bufname))
+          (grease-quit)
+        (grease-open valid-dir target-file)))))
 
 ;;;###autoload
 (defun grease-here ()
   "Open Grease buffer for the current project’s root.
-If already open, quit (saving position). Otherwise restore last position if available."
+If already open, quit (saving position). Otherwise open project root."
   (interactive)
   (let* ((proj-root (file-name-as-directory (expand-file-name (grease--project-root))))
          (proj-name (grease--project-name))
@@ -1452,9 +1493,7 @@ If already open, quit (saving position). Otherwise restore last position if avai
     (if (and (derived-mode-p 'grease-mode)
              (string= (buffer-name) bufname))
         (grease-quit)
-      (if-let ((buf (get-buffer bufname)))
-          (switch-to-buffer buf)
-        (grease-open proj-root)))))
+      (grease-open proj-root))))
 
 ;; Integrate with save-buffer
 (defun grease-advice-save-buffer (orig-fun &rest args)
