@@ -46,6 +46,39 @@
   "When non-nil, preview buffer for files is writable.
 Does not apply to directories.")
 
+;;;; Sorting Configuration
+
+(defvar grease-sort-method 'type
+  "Method for sorting files in grease buffer.
+Available options:
+  - `type': Directories first, then files (default)
+  - `name': Alphabetical by name
+  - `size': By file size (smallest first)
+  - `size-desc': By file size (largest first)
+  - `date': By modification date (oldest first)
+  - `date-desc': By modification date (newest first)
+  - `extension': By file extension")
+
+(defvar grease-sort-directories-first t
+  "When non-nil, always show directories before files regardless of sort method.
+Only applies when `grease-sort-method' is not `type'.")
+
+(defvar-local grease--current-sort-method nil
+  "Buffer-local sort method, overrides `grease-sort-method' when set.")
+
+;;;; Hidden Files Configuration
+
+(defvar grease-show-hidden nil
+  "When non-nil, show hidden files (those starting with a dot).
+Default is nil (hidden files are not shown).")
+
+(defvar-local grease--current-show-hidden nil
+  "Buffer-local setting for showing hidden files.
+When nil, uses `grease-show-hidden' as default.")
+
+(defvar-local grease--show-hidden-initialized nil
+  "Non-nil once the hidden files setting has been initialized for this buffer.")
+
 ;;;; Global State and File Tracking
 
 ;; File tracking system - keeps track of all files by ID
@@ -259,6 +292,207 @@ matching bugs (e.g., directory 'gobe' matching 'go' pattern)."
         ;; No extension
         (concat filename "-copy")))))
 
+;;;; Sorting Functions
+
+(defun grease--get-sort-method ()
+  "Get the current sort method for the buffer."
+  (or grease--current-sort-method grease-sort-method))
+
+(defun grease--file-extension (filename)
+  "Extract file extension from FILENAME, or empty string if none."
+  (let ((ext (file-name-extension filename)))
+    (or ext "")))
+
+(defun grease--sort-files (files dir)
+  "Sort FILES list according to current sort method.
+DIR is the directory containing the files."
+  (let* ((method (grease--get-sort-method))
+         (with-attrs (mapcar (lambda (f)
+                               (let* ((path (expand-file-name f dir))
+                                      (is-dir (file-directory-p path))
+                                      (attrs (file-attributes path)))
+                                 (list :name f
+                                       :path path
+                                       :is-dir is-dir
+                                       :size (or (file-attribute-size attrs) 0)
+                                       :mtime (or (file-attribute-modification-time attrs) 0)
+                                       :ext (grease--file-extension f))))
+                             files))
+         (sorted (grease--sort-by-method with-attrs method)))
+    (mapcar (lambda (item) (plist-get item :name)) sorted)))
+
+(defun grease--sort-by-method (items method)
+  "Sort ITEMS by METHOD.
+ITEMS is a list of plists with :name, :is-dir, :size, :mtime, :ext keys."
+  (let ((dirs-first grease-sort-directories-first))
+    (pcase method
+      ('type
+       ;; Directories first, then files, both alphabetically
+       (sort items (lambda (a b)
+                     (let ((a-dir (plist-get a :is-dir))
+                           (b-dir (plist-get b :is-dir)))
+                       (cond
+                        ((and a-dir (not b-dir)) t)
+                        ((and (not a-dir) b-dir) nil)
+                        (t (string< (plist-get a :name) (plist-get b :name))))))))
+      ('name
+       ;; Alphabetical, optionally with dirs first
+       (sort items (lambda (a b)
+                     (if dirs-first
+                         (let ((a-dir (plist-get a :is-dir))
+                               (b-dir (plist-get b :is-dir)))
+                           (cond
+                            ((and a-dir (not b-dir)) t)
+                            ((and (not a-dir) b-dir) nil)
+                            (t (string< (plist-get a :name) (plist-get b :name)))))
+                       (string< (plist-get a :name) (plist-get b :name))))))
+      ('size
+       ;; Smallest first
+       (sort items (lambda (a b)
+                     (if dirs-first
+                         (let ((a-dir (plist-get a :is-dir))
+                               (b-dir (plist-get b :is-dir)))
+                           (cond
+                            ((and a-dir (not b-dir)) t)
+                            ((and (not a-dir) b-dir) nil)
+                            (t (< (plist-get a :size) (plist-get b :size)))))
+                       (< (plist-get a :size) (plist-get b :size))))))
+      ('size-desc
+       ;; Largest first
+       (sort items (lambda (a b)
+                     (if dirs-first
+                         (let ((a-dir (plist-get a :is-dir))
+                               (b-dir (plist-get b :is-dir)))
+                           (cond
+                            ((and a-dir (not b-dir)) t)
+                            ((and (not a-dir) b-dir) nil)
+                            (t (> (plist-get a :size) (plist-get b :size)))))
+                       (> (plist-get a :size) (plist-get b :size))))))
+      ('date
+       ;; Oldest first
+       (sort items (lambda (a b)
+                     (if dirs-first
+                         (let ((a-dir (plist-get a :is-dir))
+                               (b-dir (plist-get b :is-dir)))
+                           (cond
+                            ((and a-dir (not b-dir)) t)
+                            ((and (not a-dir) b-dir) nil)
+                            (t (time-less-p (plist-get a :mtime) (plist-get b :mtime)))))
+                       (time-less-p (plist-get a :mtime) (plist-get b :mtime))))))
+      ('date-desc
+       ;; Newest first
+       (sort items (lambda (a b)
+                     (if dirs-first
+                         (let ((a-dir (plist-get a :is-dir))
+                               (b-dir (plist-get b :is-dir)))
+                           (cond
+                            ((and a-dir (not b-dir)) t)
+                            ((and (not a-dir) b-dir) nil)
+                            (t (time-less-p (plist-get b :mtime) (plist-get a :mtime)))))
+                       (time-less-p (plist-get b :mtime) (plist-get a :mtime))))))
+      ('extension
+       ;; By extension, then name
+       (sort items (lambda (a b)
+                     (if dirs-first
+                         (let ((a-dir (plist-get a :is-dir))
+                               (b-dir (plist-get b :is-dir)))
+                           (cond
+                            ((and a-dir (not b-dir)) t)
+                            ((and (not a-dir) b-dir) nil)
+                            (t (let ((ext-cmp (string< (plist-get a :ext) (plist-get b :ext))))
+                                 (if (string= (plist-get a :ext) (plist-get b :ext))
+                                     (string< (plist-get a :name) (plist-get b :name))
+                                   ext-cmp)))))
+                       (let ((ext-cmp (string< (plist-get a :ext) (plist-get b :ext))))
+                         (if (string= (plist-get a :ext) (plist-get b :ext))
+                             (string< (plist-get a :name) (plist-get b :name))
+                           ext-cmp))))))
+      (_
+       ;; Default to type sort
+       (grease--sort-by-method items 'type)))))
+
+;;;; Sorting Commands
+
+(defun grease--sort-and-refresh (method message)
+  "Set sort METHOD, refresh buffer, maintain cursor position, and show MESSAGE."
+  (let ((current-line (line-number-at-pos)))
+    (setq grease--current-sort-method method)
+    (grease--render grease--root-dir t)
+    (grease--goto-line-clamped current-line)
+    (message "%s" message)))
+
+(defun grease-sort-by-type ()
+  "Sort grease buffer by type (directories first, then files)."
+  (interactive)
+  (grease--sort-and-refresh 'type "Sorted by type"))
+
+(defun grease-sort-by-name ()
+  "Sort grease buffer alphabetically by name."
+  (interactive)
+  (grease--sort-and-refresh 'name "Sorted by name"))
+
+(defun grease-sort-by-size ()
+  "Sort grease buffer by file size (smallest first)."
+  (interactive)
+  (grease--sort-and-refresh 'size "Sorted by size (smallest first)"))
+
+(defun grease-sort-by-size-desc ()
+  "Sort grease buffer by file size (largest first)."
+  (interactive)
+  (grease--sort-and-refresh 'size-desc "Sorted by size (largest first)"))
+
+(defun grease-sort-by-date ()
+  "Sort grease buffer by modification date (oldest first)."
+  (interactive)
+  (grease--sort-and-refresh 'date "Sorted by date (oldest first)"))
+
+(defun grease-sort-by-date-desc ()
+  "Sort grease buffer by modification date (newest first)."
+  (interactive)
+  (grease--sort-and-refresh 'date-desc "Sorted by date (newest first)"))
+
+(defun grease-sort-by-extension ()
+  "Sort grease buffer by file extension."
+  (interactive)
+  (grease--sort-and-refresh 'extension "Sorted by extension"))
+
+(defun grease-cycle-sort ()
+  "Cycle through sort methods."
+  (interactive)
+  (let* ((methods '(type name size size-desc date date-desc extension))
+         (current (grease--get-sort-method))
+         (pos (cl-position current methods))
+         (next (nth (mod (1+ (or pos 0)) (length methods)) methods)))
+    (grease--sort-and-refresh next (format "Sorted by %s" next))))
+
+;;;; Hidden Files Functions
+
+(defun grease--hidden-file-p (filename)
+  "Return non-nil if FILENAME is a hidden file (starts with a dot)."
+  (string-prefix-p "." filename))
+
+(defun grease--show-hidden-p ()
+  "Return non-nil if hidden files should be shown."
+  (if grease--show-hidden-initialized
+      grease--current-show-hidden
+    grease-show-hidden))
+
+(defun grease--filter-hidden (files)
+  "Filter FILES list, removing hidden files if they should not be shown."
+  (if (grease--show-hidden-p)
+      files
+    (cl-remove-if #'grease--hidden-file-p files)))
+
+(defun grease-toggle-hidden ()
+  "Toggle display of hidden files (those starting with a dot)."
+  (interactive)
+  (let ((current-line (line-number-at-pos)))
+    (setq grease--show-hidden-initialized t)
+    (setq grease--current-show-hidden (not grease--current-show-hidden))
+    (grease--render grease--root-dir t)
+    (grease--goto-line-clamped current-line)
+    (message "Hidden files: %s" (if grease--current-show-hidden "shown" "hidden"))))
+
 ;;;; Buffer Rendering and Management
 
 (defun grease--insert-entry (id name type &optional source-id is-duplicate)
@@ -375,8 +609,9 @@ If target exceeds available files, go to last file line."
 
     ;; Files
     (let* ((all-files (directory-files grease--root-dir nil nil t))
-           (files (cl-remove-if (lambda (f) (member f '("." ".."))) all-files)))
-      (dolist (file (sort files #'string<))
+           (files (cl-remove-if (lambda (f) (member f '("." ".."))) all-files))
+           (files (grease--filter-hidden files)))
+      (dolist (file (grease--sort-files files grease--root-dir))
         (let* ((abs-path (expand-file-name file grease--root-dir))
                (type (if (file-directory-p abs-path) 'dir 'file))
                (existing-id (grease--get-id-by-path abs-path)))
@@ -1310,12 +1545,13 @@ Does not apply to directory listings, which remain read-only."
   (insert (propertize (format "Directory: %s\n\n" dir) 'face 'font-lock-comment-face))
   (if (file-exists-p dir)
       (let* ((files (directory-files dir nil nil t))
-             (files (cl-remove-if (lambda (f) (member f '("." ".."))) files)))
+             (files (cl-remove-if (lambda (f) (member f '("." ".."))) files))
+             (files (grease--filter-hidden files)))
         (if files
-            (dolist (file (sort files #'string<))
+            (dolist (file (grease--sort-files files dir))
               (let* ((path (expand-file-name file dir))
                      (is-dir (file-directory-p path))
-                     (icon (if grease--have-icons
+                     (icon (if (grease--icons-available-p)
                                (if is-dir
                                    (nerd-icons-sucicon "nf-custom-folder_oct")
                                  (nerd-icons-icon-for-file file))
@@ -1597,6 +1833,16 @@ Does not apply to directory listings, which remain read-only."
     (define-key map (kbd "C-c C-c") #'grease-copy)
     (define-key map (kbd "C-c C-v") #'grease-paste)
     (define-key map (kbd "C-c C-p") #'grease-toggle-preview)
+    (define-key map (kbd "C-c .") #'grease-toggle-hidden)
+    ;; Sorting keybindings
+    (define-key map (kbd "C-c s s") #'grease-cycle-sort)
+    (define-key map (kbd "C-c s t") #'grease-sort-by-type)
+    (define-key map (kbd "C-c s n") #'grease-sort-by-name)
+    (define-key map (kbd "C-c s z") #'grease-sort-by-size)
+    (define-key map (kbd "C-c s Z") #'grease-sort-by-size-desc)
+    (define-key map (kbd "C-c s d") #'grease-sort-by-date)
+    (define-key map (kbd "C-c s D") #'grease-sort-by-date-desc)
+    (define-key map (kbd "C-c s e") #'grease-sort-by-extension)
     map)
   "Keymap for `grease-mode'.")
 
@@ -1615,7 +1861,17 @@ Does not apply to directory listings, which remain read-only."
     (kbd "RET") #'grease-visit
     (kbd "-") #'grease-up-directory
     (kbd "g r") #'grease-refresh
-    (kbd "g p") #'grease-toggle-preview))
+    (kbd "g p") #'grease-toggle-preview
+    (kbd "g .") #'grease-toggle-hidden
+    ;; Sorting: g s <key>
+    (kbd "g s s") #'grease-cycle-sort
+    (kbd "g s t") #'grease-sort-by-type
+    (kbd "g s n") #'grease-sort-by-name
+    (kbd "g s z") #'grease-sort-by-size
+    (kbd "g s Z") #'grease-sort-by-size-desc
+    (kbd "g s d") #'grease-sort-by-date
+    (kbd "g s D") #'grease-sort-by-date-desc
+    (kbd "g s e") #'grease-sort-by-extension))
 
 ;;;; Entry Points
 
