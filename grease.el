@@ -20,11 +20,31 @@
 
 
 ;; Enable icons by default if available
-(defconst grease--use-icons (featurep 'nerd-icons)
+(defvar grease-use-icons t
   "Non-nil to display icons next to filenames.")
 
-(defconst grease--have-icons (and grease--use-icons (featurep 'nerd-icons))
-  "Non-nil if nerd-icons package is available and enabled.")
+(defun grease--icons-available-p ()
+  "Return non-nil if nerd-icons is available and icons are enabled."
+  (and grease-use-icons (featurep 'nerd-icons)))
+
+;;;; Preview Configuration
+
+(defvar grease-preview-window-width 0.4
+  "Width of the preview window as a fraction of the frame.")
+
+;; Preview state (buffer-local)
+(defvar-local grease--preview-buffer nil
+  "Buffer used for file previews.")
+
+(defvar-local grease--preview-window nil
+  "Window used for file previews.")
+
+(defvar grease--preview-timer nil
+  "Timer for delayed preview updates.")
+
+(defvar grease-preview-writable nil
+  "When non-nil, preview buffer for files is writable.
+Does not apply to directories.")
 
 ;;;; Global State and File Tracking
 
@@ -183,13 +203,21 @@ If ID is provided, use that ID instead of generating a new one."
       (if (grease--is-dir-name name) name (concat name "/"))
     (grease--strip-trailing-slash name)))
 
-(defun grease--get-icon (name)
-  "Get appropriate icon for NAME."
-  (if grease--have-icons
-      (if (grease--is-dir-name name)
-          (nerd-icons-icon-for-dir name)
+(defun grease--get-icon (name type full-path)
+  "Get appropriate icon for NAME of TYPE at FULL-PATH.
+For directories, uses folder icon directly to avoid nerd-icons regex
+matching bugs (e.g., directory 'gobe' matching 'go' pattern)."
+  (if (grease--icons-available-p)
+      (if (eq type 'dir)
+          ;; Use folder icon directly for directories to avoid regex matching issues
+          (cond
+           ((file-symlink-p full-path)
+            (nerd-icons-codicon "nf-cod-file_symlink_directory"))
+           ((file-exists-p (expand-file-name ".git" full-path))
+            (nerd-icons-octicon "nf-oct-repo"))
+           (t (nerd-icons-sucicon "nf-custom-folder_oct")))
         (nerd-icons-icon-for-file name))
-    (if (grease--is-dir-name name) "📁 " "📄 ")))
+    (if (eq type 'dir) "📁 " "📄 ")))
 
 (defun grease--get-full-path (name)
   "Get full path for NAME in current directory."
@@ -254,9 +282,9 @@ IS-DUPLICATE indicates if this is a copy of another file."
     (put-text-property start (point) 'grease-prefix t)
 
     ;; Insert icon if enabled
-    (when grease--use-icons
+    (when (grease--icons-available-p)
       (let* ((icon-start (point))
-             (icon (grease--get-icon display-name)))
+             (icon (grease--get-icon display-name type full-path)))
         (insert icon "  ")   ;; added two extra spaces after icon
         (put-text-property icon-start (point) 'grease-icon t)))
 
@@ -303,6 +331,27 @@ IS-DUPLICATE indicates if this is a copy of another file."
       (goto-char (point-min))
       (forward-line 1)
       (grease--constrain-cursor))))
+
+(defun grease--count-file-lines ()
+  "Count the number of file entry lines in the buffer (excluding header and blank)."
+  (save-excursion
+    (goto-char (point-min))
+    (forward-line 1) ; Skip header
+    (let ((count 0))
+      (while (not (eobp))
+        (when (grease--get-line-data)
+          (cl-incf count))
+        (forward-line 1))
+      count)))
+
+(defun grease--goto-line-clamped (target-line)
+  "Go to TARGET-LINE, clamped to valid file lines.
+Line 1 is the header, so file lines start at 2.
+If target exceeds available files, go to last file line."
+  (let ((max-file-line (1+ (grease--count-file-lines)))) ; +1 because header is line 1
+    (goto-char (point-min))
+    (forward-line (1- (max 2 (min target-line max-file-line))))
+    (grease--constrain-cursor)))
 
 (defun grease--render (dir &optional keep-changes)
   "Render the contents of DIR into the current buffer."
@@ -1158,6 +1207,151 @@ Returns a list of rename operations to be performed."
         (warn "Grease: Encountered errors:\n%s" (mapconcat #'identity errors "\n"))
       (message "Grease: All changes applied successfully."))))
 
+;;;; Preview Buffer System
+
+(defun grease--preview-buffer-name ()
+  "Return the name of the preview buffer for current grease buffer."
+  (format "*grease-preview:%s*" (grease--project-name)))
+
+(defun grease-toggle-preview ()
+  "Toggle the preview window on the right side.
+Shows file contents for files, or directory listing for directories."
+  (interactive)
+  (if (and grease--preview-window (window-live-p grease--preview-window))
+      (grease--close-preview)
+    (grease--open-preview)))
+
+(defun grease-toggle-preview-writable ()
+  "Toggle whether the preview buffer is writable for files.
+When writable, you can edit file previews directly.
+Does not apply to directory listings, which remain read-only."
+  (interactive)
+  (setq grease-preview-writable (not grease-preview-writable))
+  (message "Preview writable: %s" (if grease-preview-writable "on" "off"))
+  ;; Update current preview buffer if open
+  (when (and grease--preview-buffer (buffer-live-p grease--preview-buffer))
+    (grease--update-preview)))
+
+(defun grease--open-preview ()
+  "Open the preview window."
+  (let* ((buf-name (grease--preview-buffer-name))
+         (buf (get-buffer-create buf-name)))
+    (setq grease--preview-buffer buf)
+    (setq grease--preview-window
+          (display-buffer-in-side-window
+           buf
+           `((side . right)
+             (slot . 0)
+             (window-width . ,grease-preview-window-width)
+             (preserve-size . (t . nil)))))
+    (with-current-buffer buf
+      (setq buffer-read-only t)
+      (setq truncate-lines t))
+    (grease--update-preview)
+    (add-hook 'post-command-hook #'grease--schedule-preview-update nil t)))
+
+(defun grease--close-preview ()
+  "Close the preview window and clean up."
+  (when grease--preview-timer
+    (cancel-timer grease--preview-timer)
+    (setq grease--preview-timer nil))
+  (remove-hook 'post-command-hook #'grease--schedule-preview-update t)
+  (when (and grease--preview-window (window-live-p grease--preview-window))
+    (delete-window grease--preview-window))
+  (when (and grease--preview-buffer (buffer-live-p grease--preview-buffer))
+    (kill-buffer grease--preview-buffer))
+  (setq grease--preview-window nil)
+  (setq grease--preview-buffer nil))
+
+(defun grease--schedule-preview-update ()
+  "Schedule a preview update after a short delay (debounced)."
+  (when (and grease--preview-window
+             (window-live-p grease--preview-window)
+             (derived-mode-p 'grease-mode))
+    (when grease--preview-timer
+      (cancel-timer grease--preview-timer))
+    (setq grease--preview-timer
+          (run-with-idle-timer 0.1 nil #'grease--update-preview))))
+
+(defun grease--update-preview ()
+  "Update the preview buffer with content from file at point."
+  (when (and grease--preview-window
+             (window-live-p grease--preview-window)
+             grease--preview-buffer
+             (buffer-live-p grease--preview-buffer))
+    (let ((data (grease--get-line-data)))
+      (when data
+        (let* ((name (plist-get data :name))
+               (type (plist-get data :type))
+               (path (grease--get-full-path name))
+               (is-file (and (eq type 'file)
+                             (file-exists-p path)
+                             (file-readable-p path))))
+          (with-current-buffer grease--preview-buffer
+            (let ((inhibit-read-only t))
+              (erase-buffer)
+              (cond
+               ((eq type 'dir)
+                (grease--render-preview-directory path))
+               (is-file
+                (grease--render-preview-file path))
+               ((not (file-exists-p path))
+                (insert (format "New file: %s\n\n(File will be created on save)" name)))
+               (t
+                (insert (format "Cannot preview: %s" path))))
+              (goto-char (point-min))
+              ;; Set read-only based on type and setting
+              ;; Directories are always read-only, files respect grease-preview-writable
+              (setq buffer-read-only (or (eq type 'dir)
+                                         (not grease-preview-writable))))))))))
+
+(defun grease--render-preview-directory (dir)
+  "Render directory listing for DIR in preview buffer (read-only)."
+  (insert (propertize (format "Directory: %s\n\n" dir) 'face 'font-lock-comment-face))
+  (if (file-exists-p dir)
+      (let* ((files (directory-files dir nil nil t))
+             (files (cl-remove-if (lambda (f) (member f '("." ".."))) files)))
+        (if files
+            (dolist (file (sort files #'string<))
+              (let* ((path (expand-file-name file dir))
+                     (is-dir (file-directory-p path))
+                     (icon (if grease--have-icons
+                               (if is-dir
+                                   (nerd-icons-sucicon "nf-custom-folder_oct")
+                                 (nerd-icons-icon-for-file file))
+                             (if is-dir "dir" "file"))))
+                (insert icon "  " file (if is-dir "/" "") "\n")))
+          (insert (propertize "(empty directory)" 'face 'font-lock-comment-face))))
+    (insert (propertize "(directory will be created on save)" 'face 'font-lock-comment-face))))
+
+(defun grease--render-preview-file (path)
+  "Render file content for PATH in preview buffer."
+  (condition-case err
+      (let* ((attrs (file-attributes path))
+             (size (file-attribute-size attrs)))
+        (cond
+         ((> size (* 1024 1024))
+          (insert (propertize (format "File too large to preview\nSize: %d bytes" size)
+                              'face 'font-lock-warning-face)))
+         ((with-temp-buffer
+            (insert-file-contents path nil 0 (min size 8192))
+            (goto-char (point-min))
+            (search-forward "\0" nil t))
+          (insert (propertize "Binary file\n" 'face 'font-lock-warning-face))
+          (insert (format "Size: %d bytes\n" size))
+          (insert (format "Type: %s" (or (file-name-extension path) "unknown"))))
+         (t
+          (insert-file-contents path)
+          (let ((mode (assoc-default path auto-mode-alist 'string-match)))
+            (when (and mode (functionp mode))
+              (condition-case nil
+                  (delay-mode-hooks (funcall mode))
+                (error nil))))
+          (font-lock-ensure))))
+    (error
+     (insert (propertize (format "Error reading file: %s" (error-message-string err))
+                         'face 'font-lock-warning-face)))))
+
 ;;;; User Commands
 
 (defun grease-save ()
@@ -1318,7 +1512,8 @@ Returns a list of rename operations to be performed."
   "Visit the file or directory at point."
   (interactive)
   (grease--save-position)
-  (let ((data (grease--get-line-data)))
+  (let ((data (grease--get-line-data))
+        (current-line (line-number-at-pos)))
     (if (not data)
         (user-error "Not on a file or directory line.")
       (let* ((name (plist-get data :name))
@@ -1332,7 +1527,9 @@ Returns a list of rename operations to be performed."
                   (when changes
                     (setq grease--pending-changes
                           (append changes grease--pending-changes)))))
-              (grease--render path t))
+              (grease--render path t)
+              ;; Restore cursor position, clamped to valid lines
+              (grease--goto-line-clamped current-line))
           (grease--with-commit-prompt
            (lambda ()
              (kill-buffer (current-buffer))
@@ -1342,14 +1539,17 @@ Returns a list of rename operations to be performed."
   "Move to the parent directory."
   (interactive)
   (grease--save-position)
-  (let ((parent-dir (expand-file-name ".." grease--root-dir)))
+  (let ((parent-dir (expand-file-name ".." grease--root-dir))
+        (current-line (line-number-at-pos)))
     ;; Store any changes before moving
     (when grease--buffer-dirty-p
       (let ((changes (grease--calculate-changes)))
         (when changes
           (setq grease--pending-changes
                 (append changes grease--pending-changes)))))
-    (grease--render parent-dir t)))
+    (grease--render parent-dir t)
+    ;; Restore cursor position, clamped to valid lines
+    (grease--goto-line-clamped current-line)))
 
 (defun grease-refresh ()
   "Discard all changes and reload the directory from disk."
@@ -1396,6 +1596,7 @@ Returns a list of rename operations to be performed."
     (define-key map (kbd "C-c C-x") #'grease-cut)
     (define-key map (kbd "C-c C-c") #'grease-copy)
     (define-key map (kbd "C-c C-v") #'grease-paste)
+    (define-key map (kbd "C-c C-p") #'grease-toggle-preview)
     map)
   "Keymap for `grease-mode'.")
 
@@ -1405,6 +1606,7 @@ Returns a list of rename operations to be performed."
   (setq-local truncate-lines t)
   (setq buffer-read-only nil) ;; Ensure buffer is not read-only
   (add-hook 'after-change-functions #'grease--on-change nil t)
+  (add-hook 'kill-buffer-hook #'grease--close-preview nil t)
   (grease--setup-cursor-constraints))
 
 ;; Set up Evil keybindings
@@ -1412,8 +1614,8 @@ Returns a list of rename operations to be performed."
   (evil-define-key* 'normal grease-mode-map
     (kbd "RET") #'grease-visit
     (kbd "-") #'grease-up-directory
-    (kbd "g r") #'grease-refresh)
-  )
+    (kbd "g r") #'grease-refresh
+    (kbd "g p") #'grease-toggle-preview))
 
 ;;;; Entry Points
 
