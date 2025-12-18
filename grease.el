@@ -39,6 +39,10 @@
 (defvar-local grease--preview-window nil
   "Window used for file previews.")
 
+(defvar-local grease--preview-original-buffer nil
+  "Buffer that was in the side window before grease took it over.
+If non-nil, the window existed before grease and should be restored on close.")
+
 (defvar grease--preview-timer nil
   "Timer for delayed preview updates.")
 
@@ -1470,15 +1474,33 @@ Does not apply to directory listings, which remain read-only."
 (defun grease--open-preview ()
   "Open the preview window."
   (let* ((buf-name (grease--preview-buffer-name))
-         (buf (get-buffer-create buf-name)))
+         (buf (get-buffer-create buf-name))
+         ;; First check for any window to the right (regular split)
+         (right-window (window-in-direction 'right))
+         ;; Also check for existing side window on the right
+         (existing-side-window
+          (cl-find-if (lambda (w)
+                        (eq (window-parameter w 'window-side) 'right))
+                      (window-list)))
+         ;; Prefer regular right window, fall back to side window
+         (target-window (or right-window existing-side-window))
+         (original-buf (when target-window
+                         (window-buffer target-window))))
     (setq grease--preview-buffer buf)
-    (setq grease--preview-window
-          (display-buffer-in-side-window
-           buf
-           `((side . right)
-             (slot . 0)
-             (window-width . ,grease-preview-window-width)
-             (preserve-size . (t . nil)))))
+    (setq grease--preview-original-buffer original-buf)
+    (if target-window
+        ;; Reuse existing window (regular split or side window)
+        (progn
+          (set-window-buffer target-window buf)
+          (setq grease--preview-window target-window))
+      ;; No window to the right - create a new side window
+      (setq grease--preview-window
+            (display-buffer-in-side-window
+             buf
+             `((side . right)
+               (slot . 0)
+               (window-width . ,grease-preview-window-width)
+               (preserve-size . (t . nil))))))
     (with-current-buffer buf
       (setq buffer-read-only t)
       (setq truncate-lines t))
@@ -1492,11 +1514,17 @@ Does not apply to directory listings, which remain read-only."
     (setq grease--preview-timer nil))
   (remove-hook 'post-command-hook #'grease--schedule-preview-update t)
   (when (and grease--preview-window (window-live-p grease--preview-window))
-    (delete-window grease--preview-window))
+    (if (and grease--preview-original-buffer
+             (buffer-live-p grease--preview-original-buffer))
+        ;; Window existed before grease - restore original buffer
+        (set-window-buffer grease--preview-window grease--preview-original-buffer)
+      ;; Window was created by grease - delete it
+      (delete-window grease--preview-window)))
   (when (and grease--preview-buffer (buffer-live-p grease--preview-buffer))
     (kill-buffer grease--preview-buffer))
   (setq grease--preview-window nil)
-  (setq grease--preview-buffer nil))
+  (setq grease--preview-buffer nil)
+  (setq grease--preview-original-buffer nil))
 
 (defun grease--schedule-preview-update ()
   "Schedule a preview update after a short delay (debounced)."
