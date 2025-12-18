@@ -6,25 +6,25 @@
 * Introduction
 
 ** About Grease.el
-Grease is a *“writable buffer first”* file manager for Emacs, inspired by [[https://github.com/stevearc/oil.nvim][oil.nvim]].
-It’s not meant to replace dired/wdired or dirvish (both are fantastic!), but to offer
+Grease is a *"writable buffer first"* file manager for Emacs, inspired by [[https://github.com/stevearc/oil.nvim][oil.nvim]].
+It's not meant to replace dired/wdired or dirvish (both are fantastic!), but to offer
 an alternate workflow for file and directory management.
 
 Grease turns a directory listing into a buffer you can edit like text:
 rename, delete, yank, paste, or create files with normal Emacs/Evil motions,
-then commit your edits to the filesystem.
+then commit your edits to the filesystem by saving the buffer.
 
 ** Why make this?
 After years of loving Neovim, curiosity eventually pulled me into Emacs.
-I’ve been using Doom Emacs for just a few days, and I noticed that everything
+I've been using Doom Emacs for just a few days, and I noticed that everything
 from my highly customized LazyVim setup was already here… except one thing:
 the brilliant *oil.nvim*.
 
-I tried dired and wdired, and while they work, they didn’t feel as fast as oil.
-Dirvish is gorgeous but again, a different style.
+I tried dired and wdired, and while they work, they didn't feel as fast as oil (for me).
+Dirvish is gorgeous but again, a different style that my muscle memory wasn't used to.
 So, instead of giving up, I decided to build my own take. Part of this was to
-finally learn some Lisp (my first time!), and part was to make the Emacs
-experience a bit more familiar for fellow Neovim users exploring this world.
+finally learn some elisp (my first time!), and part was to make the Emacs
+experience a bit more familiar for fellow Neovim users exploring Emacs.
 
 * Installation
 Clone this repo somewhere on your load path (e.g. =~/.config/doom/lisp/=):
@@ -32,6 +32,77 @@ Clone this repo somewhere on your load path (e.g. =~/.config/doom/lisp/=):
 #+begin_src emacs-lisp
 (add-to-list 'load-path "~/.config/doom/lisp/grease")
 (require 'grease)
+#+end_src
+
+* Configuration
+
+** Minimal Config
+A minimal configuration with sensible defaults:
+
+#+begin_src emacs-lisp
+(use-package grease
+  :load-path "~/.config/doom/lisp/grease"
+  :commands (grease-open grease-toggle grease-here)
+  :config
+  ;; Icons are enabled by default if nerd-icons is available
+  ;; Sorting defaults to 'type (directories first, then files)
+  ;; Hidden files are hidden by default
+  )
+#+end_src
+
+** Full Config Example
+A more complete configuration showing all available options:
+
+#+begin_src emacs-lisp
+(use-package grease
+  :load-path "~/.config/doom/lisp/grease"
+  :commands (grease-open grease-toggle grease-here)
+  :init
+  ;; Icons (requires nerd-icons package)
+  (setq grease-use-icons t)              ; Set to nil to disable icons
+
+  ;; Sorting options
+  (setq grease-sort-method 'type)        ; Default sort method
+  ;; Available methods:
+  ;;   'type      - Directories first, then files (default)
+  ;;   'name      - Alphabetical by name
+  ;;   'size      - By file size (smallest first)
+  ;;   'size-desc - By file size (largest first)
+  ;;   'date      - By modification date (oldest first)
+  ;;   'date-desc - By modification date (newest first)
+  ;;   'extension - By file extension
+
+  (setq grease-sort-directories-first t) ; Always show dirs first (for non-type sorts)
+
+  ;; Hidden files
+  (setq grease-show-hidden nil)          ; Set to t to show dotfiles by default
+
+  ;; Preview window
+  (setq grease-preview-window-width 0.4) ; Preview takes 40% of frame width
+  (setq grease-preview-writable nil)     ; Set to t to make file previews editable
+  )
+#+end_src
+
+** Doom Emacs Config
+For Doom Emacs users:
+
+#+begin_src emacs-lisp
+;; In packages.el
+(package! grease :recipe (:local-repo "~/.config/doom/lisp/grease"))
+
+;; In config.el
+(use-package! grease
+  :commands (grease-open grease-toggle grease-here)
+  :init
+  (setq grease-sort-method 'type
+        grease-show-hidden nil
+        grease-preview-window-width 0.4)
+  :config
+  (map! :leader
+        (:prefix ("o g" . "Grease")
+         :desc "Toggle Grease"           "g" #'grease-toggle
+         :desc "Open Grease (current)"   "o" #'grease-open
+         :desc "Open at project root"    "h" #'grease-here)))
 #+end_src
 
 * Usage
@@ -51,14 +122,14 @@ and the directory contents.
 
 ** Editing Operations
 Each line after the header represents a file or directory.
-
+(using vim/evil bindings here but it should with default emacs keybinds too)
 - *Rename*: move to a filename, edit it, save.
 - *Delete*: delete a line with ~dd~.
 - *Create*: add a new line with ~o~, type a name, save.
-  - End with "/" to make a directory.
+- End with "/" to make a directory.
 - *Copy*: yank a line with ~yy~, paste with ~p~.
 - *Move*: cut with ~dd~, paste elsewhere with ~p~.
-- *Duplicate*: duplicate a line with ~C-c C-d~.
+- *Duplicate*: duplicate a line with ~yy~ and then ~p~.
 - *Multi-file*: visual select (~Vjjj~) then yank or delete.
 
 When ready, commit changes with:
@@ -68,6 +139,33 @@ C-c C-s
 ;; or
 :w
 #+end_src
+
+** Preview Window
+Toggle a preview window on the right side showing file contents or directory listings:
+
+- ~g p~ (Evil) or ~C-c C-p~ :: Toggle preview window
+- ~M-x grease-toggle-preview-writable~ :: Make file previews editable
+
+The preview automatically updates as you navigate.
+
+** Sorting
+Change how files are sorted in the buffer:
+
+| Evil  | Emacs   | Action                     |
+|-------+---------+----------------------------|
+| ~g s s~ | ~C-c s s~ | Cycle through sort methods |
+| ~g s t~ | ~C-c s t~ | Sort by type (dirs first)  |
+| ~g s n~ | ~C-c s n~ | Sort by name               |
+| ~g s z~ | ~C-c s z~ | Sort by size (smallest)    |
+| ~g s Z~ | ~C-c s Z~ | Sort by size (largest)     |
+| ~g s d~ | ~C-c s d~ | Sort by date (oldest)      |
+| ~g s D~ | ~C-c s D~ | Sort by date (newest)      |
+| ~g s e~ | ~C-c s e~ | Sort by extension          |
+
+** Hidden Files
+Toggle visibility of hidden files (those starting with a dot):
+
+- ~g .~ (Evil) or ~C-c .~ :: Toggle hidden files
 
 ** Example Session
 
@@ -96,11 +194,13 @@ On save:
 - ~report.md~ will be created.
 
 * Commands
-Grease provides the following entrypoints:
 
+** Entry Points
 - ~M-x grease-open~ :: Open a Grease buffer for a directory.
 - ~M-x grease-toggle~ :: Toggle Grease for the current project.
 - ~M-x grease-here~ :: Open Grease at the project root.
+
+** File Operations
 - ~M-x grease-save~ :: Save all staged changes to disk.
 - ~M-x grease-visit~ :: Visit the file or enter a directory at point.
 - ~M-x grease-up-directory~ :: Move to the parent directory.
@@ -110,32 +210,90 @@ Grease provides the following entrypoints:
 - ~M-x grease-cut~ :: Stage a cut (move).
 - ~M-x grease-copy~ :: Stage a copy.
 - ~M-x grease-paste~ :: Paste from clipboard into current directory.
-- ~M-x grease-reset-registry~ :: Reset Grease’s global file registry.
+
+** View Options
+- ~M-x grease-toggle-preview~ :: Toggle preview window.
+- ~M-x grease-toggle-preview-writable~ :: Toggle preview editability.
+- ~M-x grease-toggle-hidden~ :: Toggle hidden files visibility.
+
+** Sorting
+- ~M-x grease-sort-by-type~ :: Sort directories first, then files.
+- ~M-x grease-sort-by-name~ :: Sort alphabetically.
+- ~M-x grease-sort-by-size~ :: Sort by size (smallest first).
+- ~M-x grease-sort-by-size-desc~ :: Sort by size (largest first).
+- ~M-x grease-sort-by-date~ :: Sort by date (oldest first).
+- ~M-x grease-sort-by-date-desc~ :: Sort by date (newest first).
+- ~M-x grease-sort-by-extension~ :: Sort by file extension.
+- ~M-x grease-cycle-sort~ :: Cycle through all sort methods.
+
+** Debug
+- ~M-x grease-reset-registry~ :: Reset Grease's global file registry.
 - ~M-x grease-debug-state~ :: Debug view of registry and clipboard.
 
 * Keybinds
-Here’s a Doom-style setup:
+
+** Default Keybindings
+Inside ~grease-mode~:
+
+*** Navigation
+| Evil | Emacs | Action               |
+|------+-------+----------------------|
+| ~RET~  |       | Visit file/directory |
+| ~-~    |       | Go up one directory  |
+| ~g r~  |       | Refresh buffer       |
+
+*** File Operations
+| Evil | Emacs   | Action       |
+|------+---------+--------------|
+|      | ~C-c C-s~ | Save changes |
+|      | ~C-c C-d~ | Duplicate    |
+|      | ~C-c C-x~ | Cut          |
+|      | ~C-c C-c~ | Copy         |
+|      | ~C-c C-v~ | Paste        |
+
+*** View Options
+| Evil | Emacs   | Action              |
+|------+---------+---------------------|
+| ~g p~  | ~C-c C-p~ | Toggle preview      |
+| ~g .~  | ~C-c .~   | Toggle hidden files |
+
+*** Sorting
+| Evil  | Emacs   | Action               |
+|-------+---------+----------------------|
+| ~g s s~ | ~C-c s s~ | Cycle sort methods   |
+| ~g s t~ | ~C-c s t~ | Sort by type         |
+| ~g s n~ | ~C-c s n~ | Sort by name         |
+| ~g s z~ | ~C-c s z~ | Sort by size (small) |
+| ~g s Z~ | ~C-c s Z~ | Sort by size (large) |
+| ~g s d~ | ~C-c s d~ | Sort by date (old)   |
+| ~g s D~ | ~C-c s D~ | Sort by date (new)   |
+| ~g s e~ | ~C-c s e~ | Sort by extension    |
+
+** Custom Keybindings
+Here's an example Doom-style setup:
 
 #+begin_src emacs-lisp
 (map! :leader
       (:prefix ("o g" . "Grease")
+       :desc "Toggle Grease"             "g" #'grease-toggle
        :desc "Open Grease (current dir)" "o" #'grease-open
-       :desc "Toggle Grease"             "t" #'grease-toggle
        :desc "Open Grease at project"    "h" #'grease-here
        :desc "Save Grease changes"       "s" #'grease-save
        :desc "Refresh Grease buffer"     "r" #'grease-refresh
-       :desc "Quit Grease"               "q" #'grease-quit))
+       :desc "Quit Grease"               "q" #'grease-quit)) ;;I just always use toggle
 #+end_src
 
-Inside ~grease-mode~:
-- ~RET~ → visit file or enter directory
-- ~-~ → go up one directory
-- ~gr~ → refresh buffer
-- ~C-c C-s~ → save staged changes
-- ~C-c C-d~ → duplicate line
-- ~C-c C-x~ → cut
-- ~C-c C-c~ → copy
-- ~C-c C-v~ → paste
+
+* Configuration Variables
+
+| Variable                      | Default | Description                              |
+|-------------------------------+---------+------------------------------------------|
+| ~grease-use-icons~              | ~t~       | Show icons (requires nerd-icons)         |
+| ~grease-sort-method~            | ~'type~   | Default sorting method                   |
+| ~grease-sort-directories-first~ | ~t~       | Show directories before files            |
+| ~grease-show-hidden~            | ~nil~     | Show hidden files by default             |
+| ~grease-preview-window-width~   | ~0.4~     | Preview window width (fraction of frame) |
+| ~grease-preview-writable~       | ~nil~     | Make file previews editable              |
 
 * Feature Checklist
 
@@ -144,23 +302,30 @@ Inside ~grease-mode~:
 - [X] Rename files by editing text.
 - [X] Delete files by deleting lines.
 - [X] Create files by typing into the editable line.
-- [X] Create directories by ending a name with “/”.
+- [X] Create directories by ending a name with "/".
 - [X] Copy/paste files across directories (~yy/p~).
 - [X] Move files with cut/paste (~dd/p~).
 - [X] Multi-line yank/delete in visual mode.
 - [X] Duplicate a line (~C-c C-d~).
 - [X] Cursor constraints (never get stuck in the hidden ID/icon column).
 - [X] Persistent cursor position per project.
+- [X] Preview window with file contents / directory listing.
+- [X] Toggleable preview editability for files.
+- [X] Multiple sorting options (type, name, size, date, extension).
+- [X] Hidden files toggle.
+- [X] Cursor position maintained when sorting/toggling.
+- [X] Nested file creation in new directories
+  Example: ~dir1/file.org~ creates ~dir1/~ and then ~file.org~ inside.
+- [X] Nested directory creation before commit
+  Example: ~dir1/dir2/dir3/~ creates the full path.
 
 ** Not Yet Implemented
-- [ ] Nested directory creation before commit  
-  Example: ~dir1/dir2/dir3/~ creates the full path.
-- [ ] Nested file creation in new directories  
-  Example: ~dir1/file.org~ creates ~dir1/~ and then ~file.org~ inside.
-- [ ] Undo/redo of staged changes (currently limited).
-- [ ] Tighter integration with dired/project.el (future possibility).
+- [ ] Tighter integration with dired/dirvish (future possibility).
 
 * Disclaimer
-Grease is early and evolving. It makes *real changes on disk*.  
-Although it always asks for confirmation and tries to be careful, bugs are possible and *data loss could occur*.  
+Grease is early and evolving. It makes *real changes on disk*.
+Although it always asks for confirmation and tries to be careful, bugs are possible and *data loss could occur*.
 Use at your own risk — and *always* with version control.
+
+I use Doom Emacs as my first and only intro to Emacs and only use the vim/evil keybinds
+so I'm unsure if I missed something to make it a seamless experience with default or different emacs setups
