@@ -4,6 +4,9 @@
 (require 'ert)
 (require 'grease)
 
+;; Run with: emacs -batch -l grease.el -l grease-test.el -f ert-run-tests-batch-and-exit
+
+;; or M-x ert
 
 ;;;; Test Setup
 
@@ -585,6 +588,188 @@
     (grease-test-with-buffer temp-dir
       (let ((entries (grease--scan-buffer)))
         (should (= 3 (length entries)))))))
+
+;;;; Standard Emacs Editing Tests
+
+(ert-deftest grease-test-emacs-type-new-filename ()
+  "Test typing a new filename on editable line."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (forward-line -1)
+      (let ((inhibit-read-only t))
+        (insert "brandnew.txt"))
+      (grease--format-plain-lines)
+      (let ((changes (grease--calculate-changes)))
+        (should (cl-find-if (lambda (c)
+                              (and (eq (car c) :create)
+                                   (string-match-p "brandnew.txt" (cadr c))))
+                            changes))))))
+
+(ert-deftest grease-test-emacs-delete-whole-line ()
+  "Test deleting a whole line with kill-whole-line behavior."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "deleteme.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-min))
+      (forward-line 1)
+      (let ((inhibit-read-only t))
+        (delete-region (line-beginning-position) (min (1+ (line-end-position)) (point-max))))
+      (let ((changes (grease--calculate-changes)))
+        (should (= 1 (length changes)))
+        (should (eq (caar changes) :delete))
+        (should (string-match-p "deleteme.txt" (cadar changes)))))))
+
+(ert-deftest grease-test-emacs-partial-delete-filename-only ()
+  "Test deleting just the filename text (not the whole line)."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "partial.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-min))
+      (forward-line 1)
+      (let* ((line-start (line-beginning-position))
+             (line-end (line-end-position))
+             (line-text (buffer-substring line-start line-end))
+             (name-match (string-match "partial\\.txt" line-text))
+             (inhibit-read-only t))
+        (when name-match
+          (goto-char (+ line-start name-match))
+          (delete-region (point) line-end)))
+      (let ((line-data (grease--get-line-data)))
+        (should line-data)))))
+
+(ert-deftest grease-test-emacs-backspace-partial ()
+  "Test backspacing part of a filename - should be treated as rename."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "longname.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-min))
+      (forward-line 1)
+      (end-of-line)
+      (let ((inhibit-read-only t))
+        (delete-char -4))
+      (grease--update-line-metadata)
+      (let ((data (grease--get-line-data)))
+        (should data)
+        (should (string-match-p "longname" (plist-get data :name)))))))
+
+(ert-deftest grease-test-emacs-rename-by-editing ()
+  "Test renaming a file by editing its name in the buffer."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "oldname.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-min))
+      (forward-line 1)
+      (let* ((line-start (line-beginning-position))
+             (line-text (buffer-substring line-start (line-end-position)))
+             (name-start (string-match "oldname" line-text))
+             (inhibit-read-only t))
+        (when name-start
+          (goto-char (+ line-start name-start))
+          (delete-char 7)
+          (insert "newname")))
+      (grease--update-line-metadata)
+      (let ((changes (grease--calculate-changes)))
+        (should (cl-find-if (lambda (c) (eq (car c) :rename)) changes))))))
+
+(ert-deftest grease-test-emacs-kill-line ()
+  "Test C-k (kill-line) behavior."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "killme.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-min))
+      (forward-line 1)
+      (let ((inhibit-read-only t))
+        (kill-line)
+        (when (looking-at "\n") (delete-char 1)))
+      (let ((changes (grease--calculate-changes)))
+        (should (cl-find-if (lambda (c)
+                              (and (eq (car c) :delete)
+                                   (string-match-p "killme" (cadr c))))
+                            changes))))))
+
+(ert-deftest grease-test-emacs-yank-plain-text ()
+  "Test yanking plain text from kill ring."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (kill-new "pasted-file.txt")
+      (goto-char (point-max))
+      (forward-line -1)
+      (let ((inhibit-read-only t))
+        (yank))
+      (grease--format-plain-lines)
+      (let ((changes (grease--calculate-changes)))
+        (should (cl-find-if (lambda (c)
+                              (and (eq (car c) :create)
+                                   (string-match-p "pasted-file" (cadr c))))
+                            changes))))))
+
+(ert-deftest grease-test-emacs-insert-multiple-lines ()
+  "Test inserting multiple filenames at once."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "file1.txt\nfile2.txt\nfile3.txt\n"))
+      (grease--format-plain-lines)
+      (let ((changes (grease--calculate-changes)))
+        (should (>= (length (cl-remove-if-not
+                             (lambda (c) (eq (car c) :create))
+                             changes))
+                    3))))))
+
+(ert-deftest grease-test-emacs-create-directory-with-slash ()
+  "Test creating a directory by typing name with trailing slash."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "newdir/\n"))
+      (grease--format-plain-lines)
+      (let ((changes (grease--calculate-changes)))
+        (should (cl-find-if (lambda (c)
+                              (and (eq (car c) :create)
+                                   (string-suffix-p "newdir/" (cadr c))))
+                            changes))))))
+
+(ert-deftest grease-test-emacs-empty-line-no-change ()
+  "Test that empty lines don't create spurious changes."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "existing.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "\n\n\n"))
+      (let ((changes (grease--calculate-changes)))
+        (should (null changes))))))
+
+(ert-deftest grease-test-emacs-whitespace-only-no-change ()
+  "Test that whitespace-only lines don't create files."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "   \n\t\t\n"))
+      (let ((changes (grease--calculate-changes)))
+        (should (null changes))))))
+
+(ert-deftest grease-test-line-data-after-partial-edit ()
+  "Test that line data is retrievable after partial filename edit."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "editme.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-min))
+      (forward-line 1)
+      (let ((original-id (plist-get (grease--get-line-data) :id)))
+        (end-of-line)
+        (let ((inhibit-read-only t))
+          (delete-char -4)
+          (insert ".md"))
+        (grease--update-line-metadata)
+        (let ((new-data (grease--get-line-data)))
+          (should new-data)
+          (should (equal (plist-get new-data :id) original-id))
+          (should (string-match-p "\\.md" (plist-get new-data :name))))))))
 
 (provide 'grease-test)
 ;;; grease-test.el ends here
