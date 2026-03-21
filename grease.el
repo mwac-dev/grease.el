@@ -156,7 +156,9 @@ Each entry is keyed by unique ID and contains:
   (cond
    ((fboundp 'project-current)
     (when-let ((proj (project-current nil)))
-      (car (project-roots proj))))
+      (if (fboundp 'project-root)
+              (project-root proj)
+            (car (project-roots proj)))))
    ((fboundp 'projectile-project-root)
     (ignore-errors (projectile-project-root)))
    (t default-directory)))
