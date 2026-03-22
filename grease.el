@@ -1802,11 +1802,12 @@ Does not apply to directory listings, which remain read-only."
              (find-file path))))))))
 
 (defun grease-up-directory ()
-  "Move to the parent directory."
+  "Move to the parent directory, placing cursor on the directory just exited."
   (interactive)
   (grease--save-position)
-  (let ((parent-dir (expand-file-name ".." grease--root-dir))
-        (current-line (line-number-at-pos)))
+  (let* ((child-dir (directory-file-name grease--root-dir))
+         (child-name (file-name-nondirectory child-dir))
+         (parent-dir (expand-file-name ".." grease--root-dir)))
     ;; Store any changes before moving
     (when grease--buffer-dirty-p
       (let ((changes (grease--calculate-changes)))
@@ -1814,8 +1815,7 @@ Does not apply to directory listings, which remain read-only."
           (setq grease--pending-changes
                 (append changes grease--pending-changes)))))
     (grease--render parent-dir t)
-    ;; Restore cursor position, clamped to valid lines
-    (grease--goto-line-clamped current-line)))
+    (grease--goto-file child-name)))
 
 (defun grease-refresh ()
   "Discard all changes and reload the directory from disk."
