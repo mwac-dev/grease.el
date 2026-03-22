@@ -153,15 +153,15 @@ Each entry is keyed by unique ID and contains:
 
 (defun grease--project-root ()
   "Return the root directory of the current project, or `default-directory`."
-  (cond
-   ((fboundp 'project-current)
-    (when-let ((proj (project-current nil)))
-      (if (fboundp 'project-root)
-              (project-root proj)
-            (car (project-roots proj)))))
-   ((fboundp 'projectile-project-root)
-    (ignore-errors (projectile-project-root)))
-   (t default-directory)))
+  (or
+   (when (fboundp 'project-current)
+     (when-let ((proj (project-current nil)))
+       (if (fboundp 'project-root)
+           (project-root proj)
+         (car (project-roots proj)))))
+   (when (fboundp 'projectile-project-root)
+     (ignore-errors (projectile-project-root)))
+   default-directory))
 
 
 (defun grease--project-name ()
