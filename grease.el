@@ -273,11 +273,11 @@ matching bugs (e.g., directory 'gobe' matching 'go' pattern)."
       ;; Got the text after the ID, now extract just the filename (after any icon)
       (let ((content (match-string 1 text)))
         ;; Look for the first alphanumeric or allowed special char that starts the filename
-        (if (string-match "\\(?:[^\n[:alnum:]/._-]\\s-*\\)*\\([[:alnum:]/._-].*\\)$" content)
+        (if (string-match "\\(?:[^\n[:alnum:]/._+-]\\s-*\\)*\\([[:alnum:]/._+-].*\\)$" content)
             (match-string 1 content)
           content)) ;; Fallback to the whole content
     ;; No ID, try to extract filename directly
-    (if (string-match "\\(?:[^\n[:alnum:]/._-]\\s-*\\)*\\([[:alnum:]/._-].*\\)$" text)
+    (if (string-match "\\(?:[^\n[:alnum:]/._+-]\\s-*\\)*\\([[:alnum:]/._+-].*\\)$" text)
         (match-string 1 text)
       ;; Last resort fallback
       (string-trim text))))
@@ -1536,39 +1536,65 @@ Does not apply to directory listings, which remain read-only."
     (when grease--preview-timer
       (cancel-timer grease--preview-timer))
     (setq grease--preview-timer
-          (run-with-idle-timer 0.1 nil #'grease--update-preview))))
+          (run-with-idle-timer 0.1 nil #'grease--update-preview (current-buffer)))))
 
-(defun grease--update-preview ()
-  "Update the preview buffer with content from file at point."
-  (when (and grease--preview-window
-             (window-live-p grease--preview-window)
-             grease--preview-buffer
-             (buffer-live-p grease--preview-buffer))
-    (let ((data (grease--get-line-data)))
-      (when data
-        (let* ((name (plist-get data :name))
-               (type (plist-get data :type))
-               (path (grease--get-full-path name))
-               (is-file (and (eq type 'file)
-                             (file-exists-p path)
-                             (file-readable-p path))))
-          (with-current-buffer grease--preview-buffer
-            (let ((inhibit-read-only t))
-              (erase-buffer)
-              (cond
-               ((eq type 'dir)
-                (grease--render-preview-directory path))
-               (is-file
-                (grease--render-preview-file path))
-               ((not (file-exists-p path))
-                (insert (format "New file: %s\n\n(File will be created on save)" name)))
-               (t
-                (insert (format "Cannot preview: %s" path))))
-              (goto-char (point-min))
-              ;; Set read-only based on type and setting
-              ;; Directories are always read-only, files respect grease-preview-writable
-              (setq buffer-read-only (or (eq type 'dir)
-                                         (not grease-preview-writable))))))))))
+(defun grease--update-preview (&optional source-buffer)
+  "Update the preview buffer with content from file at point.
+SOURCE-BUFFER is the Grease buffer whose point and buffer-local state should
+be used.  Timers do not reliably run with the Grease buffer current."
+  (let ((source-buffer (or source-buffer (current-buffer))))
+    (when (buffer-live-p source-buffer)
+      (with-current-buffer source-buffer
+        (when (and grease--preview-window
+                   (window-live-p grease--preview-window)
+                   grease--preview-buffer
+                   (buffer-live-p grease--preview-buffer))
+          (let ((data (grease--get-line-data)))
+            (when data
+              (let* ((name (plist-get data :name))
+                     (type (plist-get data :type))
+                     (path (grease--get-full-path name))
+                     (preview-buffer grease--preview-buffer)
+                     (preview-writable grease-preview-writable)
+                     (root-dir grease--root-dir)
+                     (current-sort-method grease--current-sort-method)
+                     (show-hidden-initialized grease--show-hidden-initialized)
+                     (current-show-hidden grease--current-show-hidden)
+                     (is-file (and (eq type 'file)
+                                   (file-exists-p path)
+                                   (file-readable-p path))))
+                (with-current-buffer preview-buffer
+                  (let ((inhibit-read-only t)
+                        (inhibit-modification-hooks t)
+                        (buffer-undo-list t))
+                    ;; Preview buffers are reused across many file types.  Reset
+                    ;; the old mode before replacing text so stale font-lock,
+                    ;; treesit, or track-changes hooks from the previous preview
+                    ;; cannot observe an erase/insert for unrelated content.
+                    (setq buffer-read-only nil)
+                    (fundamental-mode)
+                    ;; Preserve the Grease buffer's view options while rendering
+                    ;; directory previews from the preview buffer.
+                    (let ((grease--root-dir root-dir)
+                          (grease--current-sort-method current-sort-method)
+                          (grease--show-hidden-initialized show-hidden-initialized)
+                          (grease--current-show-hidden current-show-hidden))
+                      (erase-buffer)
+                      (cond
+                       ((eq type 'dir)
+                        (grease--render-preview-directory path))
+                       (is-file
+                        (grease--render-preview-file path))
+                       ((not (file-exists-p path))
+                        (insert (format "New file: %s\n\n(File will be created on save)" name)))
+                       (t
+                        (insert (format "Cannot preview: %s" path))))
+                      (goto-char (point-min)))
+                    ;; Set read-only based on type and setting.
+                    ;; Directories are always read-only, files respect
+                    ;; `grease-preview-writable'.
+                    (setq buffer-read-only (or (eq type 'dir)
+                                               (not preview-writable)))))))))))))
 
 (defun grease--render-preview-directory (dir)
   "Render directory listing for DIR in preview buffer (read-only)."
@@ -1876,9 +1902,12 @@ Does not apply to directory listings, which remain read-only."
     map)
   "Keymap for `grease-mode'.")
 
-(define-derived-mode grease-mode prog-mode "Grease"
+(define-derived-mode grease-mode fundamental-mode "Grease"
   "A major mode for oil.nvim-style file management."
   :syntax-table nil
+  ;; Grease buffers are editable directory listings, not source files.  Avoid
+  ;; `prog-mode' hooks such as tree-sitter/font-lock change tracking, which can
+  ;; assert when Evil opens and edits synthetic listing lines.
   (setq-local truncate-lines t)
   (setq buffer-read-only nil) ;; Ensure buffer is not read-only
   (add-hook 'after-change-functions #'grease--on-change nil t)
