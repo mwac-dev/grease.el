@@ -196,6 +196,28 @@ If ID is provided, use that ID instead of generating a new one."
   "Get file info for ID from registry."
   (gethash id grease--file-registry))
 
+(defun grease--real-file-id-p (id)
+  "Return non-nil if ID represents an existing filesystem entry."
+  (let* ((entry (and id (grease--get-file-by-id id)))
+         (path (and entry (plist-get entry :path))))
+    (and entry
+         path
+         (plist-get entry :exists)
+         (file-exists-p path))))
+
+(defun grease--line-data-real-file-p (data)
+  "Return non-nil if DATA represents an existing filesystem entry."
+  (let ((id (plist-get data :id))
+        (path (plist-get data :full-path)))
+    (and data
+         (not (plist-get data :is-new))
+         (or (grease--real-file-id-p id)
+             (and (not id) path (file-exists-p path))))))
+
+(defun grease--line-data-source-kind (data)
+  "Return `file' for existing entries and `text' for pending/new entries."
+  (if (grease--line-data-real-file-p data) 'file 'text))
+
 (defun grease--get-id-by-path (path)
   "Find the ID of file at PATH in registry, or nil if not found."
   (let ((abs-path (expand-file-name path))
@@ -711,6 +733,7 @@ If target exceeds available files, go to last file line."
              (names '())
              (types '())
              (ids '())
+             (source-kinds '())
              (paths '()))
         
         ;; Collect all selected files
@@ -723,6 +746,7 @@ If target exceeds available files, go to last file line."
                 (push (plist-get data :name) names)
                 (push (plist-get data :type) types)
                 (push (plist-get data :id) ids)
+                (push (grease--line-data-source-kind data) source-kinds)
                 (push (grease--get-full-path (plist-get data :name)) paths)))
             (forward-line 1)))
         
@@ -733,6 +757,7 @@ If target exceeds available files, go to last file line."
                       :names (nreverse names)
                       :types (nreverse types)
                       :ids (nreverse ids)
+                      :source-kinds (nreverse source-kinds)
                       :original-dir grease--root-dir))
           (setq grease--last-op-type 'file)
           (setq grease--last-kill-index 0))))
@@ -769,7 +794,7 @@ Handles both multi-line visual yanks and single-line `yy` yanks."
        ((and (boundp 'evil-state)
              (eq evil-state 'visual)
              (memq (evil-visual-type) '(line block)))
-        (let ((names '()) (types '()) (ids '()) (paths '()))
+        (let ((names '()) (types '()) (ids '()) (source-kinds '()) (paths '()))
           (save-excursion
             (goto-char beg)
             (while (< (point) end)
@@ -778,6 +803,7 @@ Handles both multi-line visual yanks and single-line `yy` yanks."
                   (push (plist-get data :name) names)
                   (push (plist-get data :type) types)
                   (push (plist-get data :id) ids)
+                  (push (grease--line-data-source-kind data) source-kinds)
                   (push (grease--get-full-path (plist-get data :name)) paths)))
               (forward-line 1)))
           (when names
@@ -786,6 +812,7 @@ Handles both multi-line visual yanks and single-line `yy` yanks."
                         :names (nreverse names)
                         :types (nreverse types)
                         :ids (nreverse ids)
+                        :source-kinds (nreverse source-kinds)
                         :original-dir grease--root-dir
                         :operation 'copy))
             (setq grease--last-op-type 'file
@@ -801,12 +828,14 @@ Handles both multi-line visual yanks and single-line `yy` yanks."
             (let* ((name (plist-get data :name))
                    (type (plist-get data :type))
                    (path (grease--get-full-path name))
-                   (id   (plist-get data :id)))
+                   (id   (plist-get data :id))
+                   (source-kind (grease--line-data-source-kind data)))
               (setq grease--clipboard
                     (list :paths (list path)
                           :names (list name)
                           :types (list type)
                           :ids (list id)
+                          :source-kinds (list source-kind)
                           :original-dir grease--root-dir
                           :operation 'copy))
               (setq grease--last-op-type 'file
@@ -826,7 +855,7 @@ Runs BEFORE Evil's delete (which will also yank)."
      ((and (boundp 'evil-state)
            (eq evil-state 'visual)
            (memq (evil-visual-type) '(line block)))
-      (let ((names '()) (types '()) (ids '()) (paths '()))
+      (let ((names '()) (types '()) (ids '()) (source-kinds '()) (paths '()))
         (save-excursion
           (goto-char (region-beginning))
           (let ((end (save-excursion (goto-char (region-end)) (line-end-position))))
@@ -836,18 +865,22 @@ Runs BEFORE Evil's delete (which will also yank)."
                   (let* ((name (plist-get data :name))
                          (type (plist-get data :type))
                          (id   (plist-get data :id))
-                         (path (grease--get-full-path name)))
+                         (path (grease--get-full-path name))
+                         (source-kind (grease--line-data-source-kind data)))
                     (push name names)
                     (push type types)
                     (push id ids)
+                    (push source-kind source-kinds)
                     (push path paths)
-                    (when id (grease--mark-file-deleted id path)))))
+                    (when (eq source-kind 'file)
+                      (grease--mark-file-deleted id path)))))
               (forward-line 1))))
         (setq grease--clipboard
               (list :paths (nreverse paths)
                     :names (nreverse names)
                     :types (nreverse types)
                     :ids   (nreverse ids)
+                    :source-kinds (nreverse source-kinds)
                     :original-dir grease--root-dir
                     :operation 'cut))
         (setq grease--last-op-type 'cut)
@@ -863,17 +896,20 @@ Runs BEFORE Evil's delete (which will also yank)."
           (let* ((name (plist-get data :name))
                  (type (plist-get data :type))
                  (path (grease--get-full-path name))
-                 (id   (plist-get data :id)))
+                 (id   (plist-get data :id))
+                 (source-kind (grease--line-data-source-kind data)))
             (setq grease--clipboard
                   (list :paths (list path)
                         :names (list name)
                         :types (list type)
                         :ids   (list id)
+                        :source-kinds (list source-kind)
                         :original-dir grease--root-dir
                         :operation 'cut))
             (setq grease--last-op-type 'cut)
             (setq grease--last-kill-index 0)
-            (when id (grease--mark-file-deleted id path))
+            (when (eq source-kind 'file)
+              (grease--mark-file-deleted id path))
             (setq grease--buffer-dirty-p t)
             (message "Cut (staged): %s" name))))))))
 
@@ -923,6 +959,9 @@ Runs BEFORE Evil's delete (which will also yank)."
                       :names (list (plist-get info :name))
                       :types (list (plist-get info :type))
                       :ids   (list (plist-get info :id))
+                      :source-kinds (list (if (grease--real-file-id-p (plist-get info :id))
+                                              'file
+                                            'text))
                       :original-dir grease--root-dir
                       :operation 'copy))))))))
 
@@ -954,8 +993,11 @@ Runs BEFORE Evil's delete (which will also yank)."
                (source-id (plist-get file-info :id))
                (name (plist-get file-info :name))
                (type (plist-get file-info :type)))
-          ;; Create a new ID but reference the source
-          (grease--insert-entry (grease--get-next-id) name type source-id t)))
+          ;; Existing entries paste as copies. Pending/new entries paste as
+          ;; fresh creates, just like typing the filename by hand.
+          (if (grease--real-file-id-p source-id)
+              (grease--insert-entry (grease--get-next-id) name type source-id t)
+            (grease--insert-entry (grease--get-next-id) name type nil nil))))
 
        ;; Case 3: Plain text (new file)
        (t
@@ -1329,13 +1371,17 @@ Returns a list of rename operations to be performed."
                              (equal (grease--get-full-path name) (nth 2 change))))
                       renames))
 
-         ;; Case 1: File copied from another file via source-id
+         ;; Case 1: Entry copied from another line via source-id.  If the
+         ;; source is a real filesystem entry, copy it.  If the source was a
+         ;; pending/new line, treat this as another create instead of trying to
+         ;; copy a file that does not exist yet.
          ((and source-id (not (eq source-id id)))
           (let* ((source-info (grease--get-file-by-id source-id))
-                 (source-path (plist-get source-info :path)))
-            (when source-path
-              ;; Add a copy operation from source to destination
-              (push `(:copy ,source-path ,(grease--get-full-path name)) changes))))
+                 (source-path (plist-get source-info :path))
+                 (dst-path (grease--get-full-path name)))
+            (if (and source-path (grease--real-file-id-p source-id))
+                (push `(:copy ,source-path ,dst-path) changes)
+              (push `(:create ,dst-path) changes))))
 
          ;; Case 2: A duplicated line within the same directory
          (is-duplicate
@@ -1345,11 +1391,15 @@ Returns a list of rename operations to be performed."
                      (and (string= (plist-get e :name) name)
                           (not (plist-get e :is-duplicate))))
                    entries))
-                 (source-entry (car matching-entries)))
+                 (source-entry (car matching-entries))
+                 (source-entry-id (plist-get source-entry :id))
+                 (source-path (and source-entry
+                                   (grease--get-full-path (plist-get source-entry :name))))
+                 (dst-path (grease--get-full-path name)))
             (when source-entry
-              (push `(:copy ,(grease--get-full-path (plist-get source-entry :name))
-                      ,(grease--get-full-path name))
-                    changes))))
+              (if (and source-path (grease--real-file-id-p source-entry-id))
+                  (push `(:copy ,source-path ,dst-path) changes)
+                (push `(:create ,dst-path) changes)))))
 
          ;; Case 3: Was this file previously deleted and moved here?
          ((and id (gethash id grease--deleted-file-ids))
@@ -1679,10 +1729,14 @@ be used.  Timers do not reliably run with the Grease buffer current."
              (type (plist-get data :type))
              (id (plist-get data :id))
              (next-id (grease--get-next-id)))
-        ;; Add a new line with the duplicated content
+        ;; Add a new line with the duplicated content.  Existing files keep a
+        ;; source ID so they become filesystem copies; pending/new files are
+        ;; inserted as fresh creates.
         (end-of-line)
         (insert "\n")
-        (grease--insert-entry next-id name type id t)
+        (grease--insert-entry next-id name type
+                              (when (grease--line-data-real-file-p data) id)
+                              (grease--line-data-real-file-p data))
         (setq grease--buffer-dirty-p t)
         (message "Duplicated: %s" name)))))
 
@@ -1695,19 +1749,23 @@ be used.  Timers do not reliably run with the Grease buffer current."
              (type (plist-get data :type))
              (path (grease--get-full-path name))
              (id (plist-get data :id)))
-        ;; Clipboard = CUT (pending move)
-        (setq grease--clipboard
-              (list :paths (list path)
-                    :names (list name)
-                    :types (list type)
-                    :ids (list id)
-                    :original-dir grease--root-dir
-                    :operation 'cut))
+        ;; Clipboard = CUT (pending move for existing files, text move for new entries)
+        (let ((source-kind (grease--line-data-source-kind data)))
+          (setq grease--clipboard
+                (list :paths (list path)
+                      :names (list name)
+                      :types (list type)
+                      :ids (list id)
+                      :source-kinds (list source-kind)
+                      :original-dir grease--root-dir
+                      :operation 'cut)))
         (setq grease--last-op-type 'cut)
         (setq grease--last-kill-index 0)
 
-        ;; Mark file as deleted by ID
-        (when id (grease--mark-file-deleted id path))
+        ;; Mark existing files as deleted by ID.  Pending/new entries do not
+        ;; exist on disk yet, so cutting them is just text movement.
+        (when (and id (grease--line-data-real-file-p data))
+          (grease--mark-file-deleted id path))
 
         ;; Delete the line visually
         (delete-region (line-beginning-position) (line-end-position))
@@ -1724,12 +1782,14 @@ be used.  Timers do not reliably run with the Grease buffer current."
              (type (plist-get data :type))
              (path (grease--get-full-path name))
              (id (plist-get data :id)))
-        ;; Store in clipboard
+        ;; Store in clipboard.  Existing files paste as filesystem copies;
+        ;; pending/new entries paste as fresh creates.
         (setq grease--clipboard
               (list :paths (list path)
                     :names (list name)
                     :types (list type)
                     :ids (list id)
+                    :source-kinds (list (grease--line-data-source-kind data))
                     :original-dir grease--root-dir
                     :operation 'copy))
         
@@ -1749,6 +1809,10 @@ be used.  Timers do not reliably run with the Grease buffer current."
            (names        (plist-get grease--clipboard :names))
            (types        (plist-get grease--clipboard :types))
            (ids          (plist-get grease--clipboard :ids))
+           (source-kinds (or (plist-get grease--clipboard :source-kinds)
+                             (mapcar (lambda (path)
+                                       (if (file-exists-p path) 'file 'text))
+                                     paths)))
            (original-dir (plist-get grease--clipboard :original-dir))
            (is-cross-dir (not (string= original-dir grease--root-dir)))
            (total-count  (length names)))
@@ -1763,14 +1827,19 @@ be used.  Timers do not reliably run with the Grease buffer current."
       (beginning-of-line)
 
       ;; Insert all entries sequentially with no extra blank lines.
-      (cl-loop for path in paths
-               for name in names
+      (cl-loop for name in names
                for type in types
                for id   in ids
+               for source-kind in source-kinds
                do
                (let* ((next-id     (grease--get-next-id))
-                      (copying     (eq operation 'copy))
-                      (moving      (memq operation '(move cut))) ; treat cut as move
+                      ;; Existing files paste as filesystem copies/moves.
+                      ;; Pending/new entries paste like freshly typed text.
+                      (copying     (and (eq operation 'copy)
+                                        (eq source-kind 'file)))
+                      (moving      (and (memq operation '(move cut))
+                                        (eq source-kind 'file)))
+                      (creating    (eq source-kind 'text))
                       (target-name (if (and copying (not is-cross-dir))
                                        (if (eq type 'dir)
                                            (concat (grease--strip-trailing-slash name) "-copy/")
@@ -1782,6 +1851,8 @@ be used.  Timers do not reliably run with the Grease buffer current."
                   (moving
                    ;; Keep same ID for cut/move
                    (grease--insert-entry id name type nil nil))
+                  (creating
+                   (grease--insert-entry next-id name type nil nil))
                   (t
                    (grease--insert-entry next-id name type nil nil)))))
 

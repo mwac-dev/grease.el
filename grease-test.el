@@ -771,5 +771,42 @@
           (should (equal (plist-get new-data :id) original-id))
           (should (string-match-p "\\.md" (plist-get new-data :name))))))))
 
+(ert-deftest grease-test-pending-copy-source-id-becomes-create ()
+  "Copy metadata from a pending new line should create, not copy from disk."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((first-id (grease--get-next-id))
+            (second-id (grease--get-next-id)))
+        (grease--insert-entry first-id "draft.txt" 'file nil nil)
+        (grease--insert-entry second-id "draft-2.txt" 'file first-id t)
+        (let ((changes (grease--calculate-changes)))
+          (should (= 2 (length (cl-remove-if-not
+                                (lambda (c) (eq (car c) :create))
+                                changes))))
+          (should-not (cl-find-if (lambda (c) (eq (car c) :copy)) changes)))))))
+
+(ert-deftest grease-test-copy-pending-new-line-pastes-as-text-create ()
+  "Pasting a copied pending line should not keep a copy source-id."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (forward-line -1)
+      (let ((inhibit-read-only t))
+        (insert "draft.txt"))
+      (grease--format-plain-lines)
+      (goto-char (point-min))
+      (forward-line 1)
+      (should (eq (grease--line-data-source-kind (grease--get-line-data)) 'text))
+      (grease-copy)
+      (should (equal (plist-get grease--clipboard :source-kinds) '(text)))
+      (grease-paste)
+      (forward-line -1)
+      (let ((pasted (grease--get-line-data)))
+        (should pasted)
+        (should (equal (plist-get pasted :name) "draft.txt"))
+        (should-not (plist-get pasted :source-id))
+        (should-not (plist-get pasted :is-duplicate))))))
+
 (provide 'grease-test)
 ;;; grease-test.el ends here
