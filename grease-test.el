@@ -528,6 +528,19 @@
           (cl-incf count))
         (should (>= count 2))))))
 
+(ert-deftest grease-test-paste-directory-after-copy-no-double-slash ()
+  "Test copied directories paste without an extra trailing slash."
+  (grease-test-with-temp-dir
+    (make-directory (expand-file-name "original-dir" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-min))
+      (forward-line 1)
+      (grease-copy)
+      (grease-paste)
+      (goto-char (point-min))
+      (should (search-forward "original-dir-copy/" nil t))
+      (should-not (search-forward "original-dir-copy//" nil t)))))
+
 ;;;; Full Path Tests
 
 (ert-deftest grease-test-get-full-path ()

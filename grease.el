@@ -1901,7 +1901,7 @@ be used.  Timers do not reliably run with the Grease buffer current."
                       (creating    (eq source-kind 'text))
                       (target-name (if (and copying (not is-cross-dir))
                                        (if (eq type 'dir)
-                                           (concat (grease--strip-trailing-slash name) "-copy/")
+                                           (concat (grease--strip-trailing-slash name) "-copy")
                                          (grease--add-copy-suffix name))
                                      name)))
                  (cond
