@@ -2119,13 +2119,14 @@ be used.  Timers do not reliably run with the Grease buffer current."
 
 ;;;###autoload
 (defun grease-open (dir &optional target-file)
-  "Open a Grease buffer for DIR, reusing the project’s Grease buffer.
+  "Open a new Grease buffer for DIR.
 If TARGET-FILE is provided, position cursor on it."
   (interactive "DGrease directory: ")
   (let* ((proj-root (file-name-as-directory (expand-file-name (grease--project-root))))
          (proj-name (grease--project-name))
-         (bufname   (format "*grease:%s*" proj-name)))
-    (with-current-buffer (get-buffer-create bufname)
+         (bufname   (format "*grease:%s*" proj-name))
+         (buf       (generate-new-buffer bufname)))
+    (with-current-buffer buf
       (grease-mode)
       ;; Always render the requested directory
       (grease--render dir)
@@ -2135,7 +2136,7 @@ If TARGET-FILE is provided, position cursor on it."
         (goto-char (point-min))
         (forward-line 1)
         (grease--constrain-cursor)))
-    (switch-to-buffer bufname)))
+    (switch-to-buffer buf)))
 
 ;;;###autoload
 (defun grease-toggle ()
@@ -2153,7 +2154,10 @@ If the current directory does not exist, traverse up to find the first valid one
 
     ;; If we're in the preview buffer, switch to grease buffer and quit
     (when (string= (buffer-name) preview-bufname)
-      (let ((grease-buf (get-buffer bufname)))
+      (let ((grease-buf (cl-find-if (lambda (b) 
+                                      (with-current-buffer b 
+                                        (derived-mode-p 'grease-mode)))
+                                    (buffer-list))))
         (when grease-buf
           (switch-to-buffer grease-buf)
           (grease-quit))
@@ -2169,8 +2173,7 @@ If the current directory does not exist, traverse up to find the first valid one
                            (when buffer-file-name (file-name-nondirectory buffer-file-name))
                          nil)))
 
-      (if (and (derived-mode-p 'grease-mode)
-               (string= (buffer-name) bufname))
+      (if (derived-mode-p 'grease-mode)
           (grease-quit)
         (grease-open valid-dir target-file)))))
 
@@ -2182,8 +2185,7 @@ If already open, quit (saving position). Otherwise open project root."
   (let* ((proj-root (file-name-as-directory (expand-file-name (grease--project-root))))
          (proj-name (grease--project-name))
          (bufname   (format "*grease:%s*" proj-name)))
-    (if (and (derived-mode-p 'grease-mode)
-             (string= (buffer-name) bufname))
+    (if (derived-mode-p 'grease-mode)
         (grease-quit)
       (grease-open proj-root))))
 
