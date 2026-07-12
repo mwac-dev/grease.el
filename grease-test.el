@@ -486,15 +486,111 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
         (should (null (grease--get-id-by-path "/nonexistent/path")))))))
 
 (ert-deftest grease-test-mark-file-deleted ()
-  "Test marking files as deleted."
+  "Test staging deletion without changing committed registry state."
   (grease-test-with-clean-state
     (grease-test-with-temp-dir
-      (let* ((path (expand-file-name "todelete.txt" temp-dir))
-             (id (grease--register-file path 'file)))
-        (grease--mark-file-deleted id path)
-        (should (equal (gethash id grease--deleted-file-ids) path))
-        (let ((info (grease--get-file-by-id id)))
-          (should (null (plist-get info :exists))))))))
+      (let ((path (expand-file-name "todelete.txt" temp-dir)))
+        (write-region "content" nil path)
+        (let ((id (grease--register-file path 'file)))
+          (grease--mark-file-deleted id path)
+          (should (equal (gethash id grease--deleted-file-ids) path))
+          (let ((info (grease--get-file-by-id id)))
+            (should (plist-get info :committed-p))
+            (should (plist-get info :exists))
+            (should (equal (plist-get info :path) path))))))))
+
+(ert-deftest grease-test-baseline-is-keyed-by-stable-id ()
+  "Rendering should snapshot committed entries by ID and absolute path."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "stable.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (let* ((data (grease-test-goto-entry "stable.txt"))
+             (id (plist-get data :id))
+             (baseline (gethash id grease--baseline-by-id)))
+        (should (equal (plist-get baseline :id) id))
+        (should (equal (plist-get baseline :path)
+                       (expand-file-name "stable.txt" temp-dir)))
+        (should (eq (plist-get baseline :type) 'file))
+        (should (plist-get baseline :committed-p))))))
+
+(ert-deftest grease-test-file-id-survives-name-edit ()
+  "Editing a filename should preserve its stable ID and committed path."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "before.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (let* ((before (grease-test-goto-entry "before.txt"))
+             (id (plist-get before :id))
+             (committed-path (plist-get (grease--get-file-by-id id) :path))
+             (after (grease-test-edit-entry id "after.txt")))
+        (should (equal (plist-get after :id) id))
+        (should (equal (plist-get after :full-path)
+                       (expand-file-name "after.txt" temp-dir)))
+        (should (equal (plist-get (grease--get-file-by-id id) :path)
+                       committed-path))))))
+
+(ert-deftest grease-test-directory-id-survives-name-edit ()
+  "Editing a directory name should preserve its stable ID."
+  (grease-test-with-temp-dir
+    (make-directory (expand-file-name "before" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (let* ((before (grease-test-goto-entry "before"))
+             (id (plist-get before :id))
+             (after (grease-test-edit-entry id "after/")))
+        (should (equal (plist-get after :id) id))
+        (should (eq (plist-get after :type) 'dir))
+        (should (equal (plist-get (gethash id grease--baseline-by-id) :path)
+                       (expand-file-name "before" temp-dir)))))))
+
+(ert-deftest grease-test-new-entry-is-uncommitted ()
+  "A newly typed entry should have an ID distinct from committed entries."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "draft.txt\n"))
+      (let* ((entry (car (grease--scan-buffer)))
+             (id (plist-get entry :id))
+             (registry-entry (grease--get-file-by-id id)))
+        (should (numberp id))
+        (should-not (plist-get entry :committed-p))
+        (should-not (plist-get registry-entry :committed-p))
+        (should-not (gethash id grease--baseline-by-id))))))
+
+(ert-deftest grease-test-copy-entry-has-new-id-and-source-id ()
+  "A copied entry should use a new ID linked to the committed source ID."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "source.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (let* ((source (grease-test-goto-entry "source.txt"))
+             (source-id (plist-get source :id)))
+        (grease-copy)
+        (grease-paste)
+        (let ((copy (cl-find-if
+                     (lambda (entry)
+                       (equal (plist-get entry :source-id) source-id))
+                     (grease--scan-buffer))))
+          (should copy)
+          (should-not (equal (plist-get copy :id) source-id))
+          (should-not (plist-get copy :committed-p))
+          (should (equal (plist-get
+                          (grease--get-file-by-id (plist-get copy :id))
+                          :source-id)
+                         source-id)))))))
+
+(ert-deftest grease-test-cut-keeps-committed-registry-state ()
+  "Staging a cut should not claim the on-disk entry has disappeared."
+  (grease-test-with-temp-dir
+    (let ((path (expand-file-name "move-me.txt" temp-dir)))
+      (write-region "preserve me" nil path)
+      (grease-test-with-buffer temp-dir
+        (let* ((data (grease-test-goto-entry "move-me.txt"))
+               (id (plist-get data :id)))
+          (grease-cut)
+          (let ((registry-entry (grease--get-file-by-id id)))
+            (should (plist-get registry-entry :committed-p))
+            (should (plist-get registry-entry :exists))
+            (should (equal (plist-get registry-entry :path) path)))
+          (should (file-exists-p path)))))))
 
 ;;;; Buffer Rendering Tests
 

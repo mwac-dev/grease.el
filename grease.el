@@ -99,7 +99,8 @@ When nil, uses `grease-show-hidden' as default.")
 (defvar grease--file-registry (make-hash-table :test 'eql)
   "Registry of all files seen during the current session.
 Each entry is keyed by unique ID and contains:
-/(:path PATH :type TYPE :exists BOOL)")
+/(:path PATH :type TYPE :committed-p BOOL :source-id ID :exists BOOL)
+`:exists' is retained temporarily for compatibility with the old diff engine.")
 
 ;; Track directories we've visited
 (defvar grease--visited-dirs nil
@@ -139,7 +140,12 @@ Each entry is keyed by unique ID and contains:
   "Current directory being displayed.")
 
 (defvar-local grease--original-state nil
-  "Hash table of original filenames -> file types.")
+  "Hash table of original filenames -> file types.
+Retained temporarily while the old diff engine is being replaced.")
+
+(defvar-local grease--baseline-by-id nil
+  "Committed filesystem snapshot keyed by stable file ID.
+Each value records `:id', original `:path', `:type', and `:committed-p'.")
 
 (defvar-local grease--buffer-dirty-p nil
   "Non-nil if buffer has unsaved changes.")
@@ -184,33 +190,35 @@ If ID is provided, use that ID instead of generating a new one."
   (let* ((abs-path (expand-file-name path))
          (file-id (or id (cl-incf grease--session-id-counter))))
     ;; Store in registry
-    (puthash file-id
-             (list :path abs-path
-                   :type type
-                   :exists (file-exists-p abs-path))
-             grease--file-registry)
+    (let ((committed-p (file-exists-p abs-path)))
+      (puthash file-id
+               (list :path abs-path
+                     :type type
+                     :committed-p committed-p
+                     :source-id nil
+                     :exists committed-p)
+               grease--file-registry))
     file-id))
 
 (defun grease--refresh-file-registration (id path type)
   "Refresh registry entry ID with current PATH, TYPE, and filesystem existence."
   (when id
-    (puthash id
-             (list :path (expand-file-name path)
-                   :type type
-                   :exists (file-exists-p path))
-             grease--file-registry)
+    (let ((committed-p (file-exists-p path)))
+      (puthash id
+               (list :path (expand-file-name path)
+                     :type type
+                     :committed-p committed-p
+                     :source-id nil
+                     :exists committed-p)
+               grease--file-registry))
     id))
 
 (defun grease--mark-file-deleted (id path)
-  "Mark file with ID at PATH as deleted."
-  (let ((entry (gethash id grease--file-registry)))
-    (when entry
-      ;; Update registry to mark as non-existent
-      (puthash id
-               (plist-put entry :exists nil)
-               grease--file-registry)
-      ;; Track the ID and original path
-      (puthash id path grease--deleted-file-ids))))
+  "Stage removal of file ID from PATH without changing committed registry data."
+  (when (gethash id grease--file-registry)
+    ;; Kept temporarily for the old diff engine.  The registry remains a view
+    ;; of committed filesystem state until a transaction succeeds.
+    (puthash id path grease--deleted-file-ids)))
 
 (defun grease--get-file-by-id (id)
   "Get file info for ID from registry."
@@ -565,9 +573,16 @@ IS-DUPLICATE indicates if this is a copy of another file."
          (start (point))
          (full-path (grease--get-full-path name)))
 
-    ;; Register this file in registry if not already there
+    ;; Entries introduced in the editor are desired state, not committed
+    ;; filesystem state.  Copies get a new ID and retain their source identity.
     (unless (grease--get-file-by-id id)
-      (grease--register-file full-path type id))
+      (puthash id
+               (list :path full-path
+                     :type type
+                     :committed-p nil
+                     :source-id source-id
+                     :exists nil)
+               grease--file-registry))
 
     ;; Insert hidden ID - invisible but not read-only
     (insert full-id " ")
@@ -655,6 +670,7 @@ If target exceeds available files, go to last file line."
     (grease--register-directory grease--root-dir)
     (erase-buffer)
     (setq grease--original-state (make-hash-table :test 'equal))
+    (setq grease--baseline-by-id (make-hash-table :test 'eql))
     (unless keep-changes
       (setq grease--pending-changes nil))
     (setq grease--buffer-dirty-p nil)
@@ -678,7 +694,13 @@ If target exceeds available files, go to last file line."
                        (gethash existing-id grease--deleted-file-ids))
             (puthash (grease--normalize-name file type) type grease--original-state)
             (when existing-id
-              (grease--refresh-file-registration existing-id abs-path type))
+              (grease--refresh-file-registration existing-id abs-path type)
+              (puthash existing-id
+                       (list :id existing-id
+                             :path abs-path
+                             :type type
+                             :committed-p t)
+                       grease--baseline-by-id))
             (grease--insert-entry
              (or existing-id (cl-incf grease--session-id-counter))
              file type nil nil)))))
@@ -1245,10 +1267,16 @@ Runs BEFORE Evil's delete (which will also yank)."
                    (is-duplicate (plist-get line-data :is-duplicate))
                    (full-path (plist-get line-data :full-path))
                    (is-new (plist-get line-data :is-new))
+                   (registry-entry (and id (grease--get-file-by-id id)))
                    (data (list :name name
+                               :path full-path
                                :type type
                                :id id
-                               :source-id source-id
+                               :committed-p (and registry-entry
+                                                 (plist-get registry-entry :committed-p))
+                               :source-id (or source-id
+                                              (and registry-entry
+                                                   (plist-get registry-entry :source-id)))
                                :is-duplicate is-duplicate
                                :full-path full-path
                                :is-new is-new)))
