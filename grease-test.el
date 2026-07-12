@@ -1592,6 +1592,55 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
 
 ;;;; Scan Buffer Tests
 
+(ert-deftest grease-test-scan-canonicalizes-typed-directory ()
+  "Typing a directory should keep display slashes out of structured state."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "test/\n"))
+      (let* ((entries (grease--scan-buffer))
+             (entry (car entries)))
+        (should (= 1 (length entries)))
+        (should (equal (plist-get entry :name) "test"))
+        (should (eq (plist-get entry :type) 'dir))
+        (should (equal (plist-get entry :path)
+                       (expand-file-name "test" temp-dir)))
+        (should-not (string-suffix-p "/" (plist-get entry :path)))
+        (should (string-match-p "test/" (buffer-string)))
+        (should-not (string-match-p "test//" (buffer-string)))))))
+
+(ert-deftest grease-test-insert-directory-adds-one-display-slash ()
+  "Directory rendering should add exactly one display-only trailing slash."
+  (grease-test-with-clean-state
+    (with-temp-buffer
+      (grease-mode)
+      (setq grease--root-dir "/tmp/")
+      (grease--insert-entry 42 "test///" 'dir)
+      (should (string-match-p "test/" (buffer-string)))
+      (should-not (string-match-p "test//" (buffer-string)))
+      (goto-char (point-min))
+      ;; The synthetic test buffer has no header, so inspect properties
+      ;; directly rather than the header-aware line-data helper.
+      (should (equal (get-text-property (point) 'grease-name) "test"))
+      (should (equal (get-text-property (point) 'grease-full-path)
+                     "/tmp/test")))))
+
+(ert-deftest grease-test-directory-type-and-id-survive-rescan ()
+  "Canonicalizing directory metadata should not change its type or identity."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "test/\n"))
+      (let* ((first (car (grease--scan-buffer)))
+             (id (plist-get first :id))
+             (second (car (grease--scan-buffer))))
+        (should (numberp id))
+        (should (equal (plist-get second :id) id))
+        (should (eq (plist-get second :type) 'dir))
+        (should (equal (plist-get second :name) "test"))))))
+
 (ert-deftest grease-test-scan-buffer-entries ()
   "Test that scan buffer returns all entries."
   (grease-test-with-temp-dir

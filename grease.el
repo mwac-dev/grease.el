@@ -279,10 +279,13 @@ If ID is provided, use that ID instead of generating a new one."
     name))
 
 (defun grease--normalize-name (name type)
-  "Normalize NAME based on TYPE, ensuring directories have trailing slashes."
-  (if (eq type 'dir)
-      (if (grease--is-dir-name name) name (concat name "/"))
-    (grease--strip-trailing-slash name)))
+  "Normalize NAME for display based on TYPE."
+  (let ((canonical (grease--canonical-entry-name name)))
+    (if (eq type 'dir) (concat canonical "/") canonical)))
+
+(defun grease--canonical-entry-name (name)
+  "Return structured entry NAME without display-only trailing slashes."
+  (replace-regexp-in-string "/+\\'" "" name))
 
 (defun grease--get-icon (name type full-path)
   "Get appropriate icon for NAME of TYPE at FULL-PATH.
@@ -301,8 +304,8 @@ matching bugs (e.g., directory 'gobe' matching 'go' pattern)."
     (if (eq type 'dir) "📁 " "📄 ")))
 
 (defun grease--get-full-path (name)
-  "Get full path for NAME in current directory."
-  (expand-file-name (grease--strip-trailing-slash name) grease--root-dir))
+  "Get the canonical full path for entry NAME in the current directory."
+  (expand-file-name (grease--canonical-entry-name name) grease--root-dir))
 
 (defun grease--get-create-path (name type)
   "Get full creation path for NAME and TYPE in current directory.
@@ -557,11 +560,12 @@ ITEMS is a list of plists with :name, :is-dir, :size, :mtime, :ext keys."
 SOURCE-ID is the ID of the source file if this is a copy.
 IS-DUPLICATE indicates if this is a copy of another file."
   (let* ((is-dir (eq type 'dir))
-         (display-name (if is-dir (concat name "/") name))
+         (canonical-name (grease--canonical-entry-name name))
+         (display-name (if is-dir (concat canonical-name "/") canonical-name))
          (id-str (grease--format-id id))
          (full-id (concat grease--id-prefix id-str))
          (start (point))
-         (full-path (grease--get-full-path name)))
+         (full-path (grease--get-full-path canonical-name)))
 
     ;; Entries introduced in the editor are desired state, not committed
     ;; filesystem state.  Copies get a new ID and retain their source identity.
@@ -593,7 +597,7 @@ IS-DUPLICATE indicates if this is a copy of another file."
       ;; Store metadata as text properties on the whole line
       (add-text-properties start (point)
                           (list 'grease-id id
-                                'grease-name name
+                                'grease-name canonical-name
                                 'grease-type type
                                 'grease-source-id source-id
                                 'grease-is-duplicate is-duplicate
@@ -1165,7 +1169,7 @@ Runs BEFORE Evil's delete (which will also yank)."
                                   line-beg line-end))
                    (clean-text (grease--extract-filename visible-text))
                    (is-dir (grease--is-dir-name clean-text))
-                  (name (grease--normalize-name clean-text (if is-dir 'dir 'file)))
+                  (name (grease--canonical-entry-name clean-text))
                   (type (if is-dir 'dir 'file))
                    (full-path (grease--get-full-path name)))
 
@@ -1211,7 +1215,7 @@ Runs BEFORE Evil's delete (which will also yank)."
 
                 ;; Insert the formatted entry
                 (grease--insert-entry next-id
-                                     (grease--normalize-name file-name type)
+                                     (grease--canonical-entry-name file-name)
                                      type)
 
                 ;; Add a new editable line if needed
