@@ -2283,6 +2283,54 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
                         (expand-file-name "copy.txt" target-dir))
                        "copy-content"))))))
 
+(ert-deftest grease-test-save-conflict-keep-preserves-all-buffer-state ()
+  "Choosing k after an identity conflict should keep every edit intact."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "same.txt" temp-dir))
+    (grease-test-with-buffers ((left temp-dir) (right temp-dir))
+      (with-current-buffer left
+        (grease-test-edit-entry "same.txt" "left.txt"))
+      (with-current-buffer right
+        (grease-test-edit-entry "same.txt" "right.txt"))
+      (let (prompt)
+        (cl-letf (((symbol-function 'read-char-choice)
+                   (lambda (text &rest _)
+                     (setq prompt text)
+                     ?k)))
+          (with-current-buffer left
+            (should-not (grease-save))))
+        (should (string-match-p "k = keep editing" prompt))
+        (should (string-match-p "d = discard all" prompt))
+        (should (string-match-p "left.txt" prompt))
+        (should (string-match-p "right.txt" prompt)))
+      (with-current-buffer left
+        (should grease--buffer-dirty-p)
+        (should (string-match-p "left.txt" (buffer-string))))
+      (with-current-buffer right
+        (should grease--buffer-dirty-p)
+        (should (string-match-p "right.txt" (buffer-string))))
+      (should (file-exists-p (expand-file-name "same.txt" temp-dir))))))
+
+(ert-deftest grease-test-save-conflict-discard-clears-all-staged-state ()
+  "Choosing d after a conflict should rerender every dirty buffer from disk."
+  (grease-test-with-temp-dir
+    (write-region "content" nil (expand-file-name "same.txt" temp-dir))
+    (grease-test-with-buffers ((left temp-dir) (right temp-dir))
+      (with-current-buffer left
+        (grease-test-edit-entry "same.txt" "left.txt"))
+      (with-current-buffer right
+        (grease-test-edit-entry "same.txt" "right.txt"))
+      (cl-letf (((symbol-function 'read-char-choice) (lambda (&rest _) ?d)))
+        (with-current-buffer right
+          (should (grease-save))))
+      (dolist (buffer (list left right))
+        (with-current-buffer buffer
+          (should-not grease--buffer-dirty-p)
+          (should-not grease--pending-changes)
+          (should (string-match-p "same.txt" (buffer-string)))
+          (should-not (string-match-p "left.txt\\|right.txt" (buffer-string)))))
+      (should (file-exists-p (expand-file-name "same.txt" temp-dir))))))
+
 (ert-deftest grease-test-save-cancel-keeps-all-participants-dirty ()
   "Cancelling a unified save should preserve all staged buffer state."
   (grease-test-with-temp-dir

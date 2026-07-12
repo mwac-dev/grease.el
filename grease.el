@@ -2268,12 +2268,9 @@ be used.  Timers do not reliably run with the Grease buffer current."
   (setq grease--clipboard nil)
   (grease--rerender-live-buffers buffers nil))
 
-;;;###autoload
-(defun grease-save-all-buffers ()
-  "Save all staged Grease-buffer changes as one filesystem transaction."
-  (interactive)
-  (let* ((all-buffers (grease--live-buffers))
-         (transaction (grease--build-transaction all-buffers))
+(defun grease--save-all-buffers-transaction (all-buffers)
+  "Build and save one transaction from ALL-BUFFERS."
+  (let* ((transaction (grease--build-transaction all-buffers))
          (operations (plist-get transaction :operations))
          (participants (plist-get transaction :buffers)))
     (if (not operations)
@@ -2316,6 +2313,47 @@ be used.  Timers do not reliably run with the Grease buffer current."
                  (grease--rerender-live-buffers all-buffers operations)
                  (message "Grease: Transaction committed successfully.")
                  t)))))))))
+
+(defun grease--buffers-with-staged-state (buffers)
+  "Return BUFFERS with dirty or pending Grease state."
+  (cl-remove-if-not
+   (lambda (buffer)
+     (and (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (and (derived-mode-p 'grease-mode)
+                 (or grease--buffer-dirty-p grease--pending-changes)))))
+   buffers))
+
+(defun grease--handle-transaction-conflict (error buffers)
+  "Offer to keep or discard staged state after transaction ERROR in BUFFERS."
+  (let* ((staged-buffers (grease--buffers-with-staged-state buffers))
+         (choice
+          (read-char-choice
+           (format (concat "Grease transaction conflict:\n%s\n\n"
+                           "k = keep editing\n"
+                           "d = discard all staged Grease-buffer changes\n")
+                   (error-message-string error))
+           '(?k ?d))))
+    (pcase choice
+      (?d
+       (grease--discard-transaction staged-buffers)
+       (message "Grease: Discarded all staged changes after conflict.")
+       t)
+      (_
+       (message "Grease: Conflict preserved; keep editing to resolve it.")
+       nil))))
+
+;;;###autoload
+(defun grease-save-all-buffers ()
+  "Save all staged Grease-buffer changes as one filesystem transaction.
+If transaction construction or validation finds a conflict, offer to keep
+editing or discard all staged Grease-buffer changes."
+  (interactive)
+  (let ((all-buffers (grease--live-buffers)))
+    (condition-case error
+        (grease--save-all-buffers-transaction all-buffers)
+      (user-error
+       (grease--handle-transaction-conflict error all-buffers)))))
 
 (defun grease-save ()
   "Delegate saving to `grease-save-all-buffers'."
