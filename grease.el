@@ -1638,6 +1638,46 @@ paths or authoritative states signal `user-error' before any mutation."
   "Return non-nil when PATH names an existing entry or symbolic link."
   (or (file-exists-p path) (file-symlink-p path)))
 
+(defun grease--expand-parent-directory-creates (semantic-operations)
+  "Add explicit create operations for missing destination parent directories."
+  (let ((providers (make-hash-table :test 'equal))
+        (destinations (make-hash-table :test 'equal))
+        (needed (make-hash-table :test 'equal))
+        implicit-parents)
+    (dolist (operation semantic-operations)
+      (when-let ((dst (grease--operation-destination operation)))
+        (puthash dst operation destinations)
+        (when (and (memq (plist-get operation :kind) '(create relocate))
+                   (eq (plist-get operation :type) 'dir))
+          (puthash dst operation providers))))
+    (dolist (operation semantic-operations)
+      (when-let ((dst (grease--operation-destination operation)))
+        (let ((parent
+               (directory-file-name
+                (file-name-directory (directory-file-name dst)))))
+          (while (and parent
+                      (not (equal parent (directory-file-name dst)))
+                      (not (file-directory-p parent))
+                      (not (gethash parent providers)))
+            (when (grease--path-occupied-p parent)
+              (user-error "Destination ancestor is not a directory: %s" parent))
+            (when-let ((claim (gethash parent destinations)))
+              (unless (and (memq (plist-get claim :kind) '(create relocate))
+                           (eq (plist-get claim :type) 'dir))
+                (user-error "Scheduled destination ancestor is not a directory: %s"
+                            parent)))
+            (unless (gethash parent needed)
+              (puthash parent t needed)
+              (push (list :kind 'create
+                          :id nil
+                          :dst parent
+                          :type 'dir
+                          :implicit-parent-p t)
+                    implicit-parents))
+            (let ((next (directory-file-name (file-name-directory parent))))
+              (setq parent (unless (equal next parent) next)))))))
+    (append (nreverse implicit-parents) semantic-operations)))
+
 (defun grease--temporary-cycle-path (operation reserved-paths)
   "Return a unique temporary sibling path for OPERATION.
 RESERVED-PATHS contains every transaction source and destination."
@@ -1720,7 +1760,8 @@ RESERVED-PATHS contains every transaction source and destination."
   "Validate and safely order SEMANTIC-OPERATIONS, breaking relocation cycles."
   (let* ((operations
           (grease--break-relocation-cycles
-           (grease--normalize-operation-paths semantic-operations)))
+           (grease--expand-parent-directory-creates
+            (grease--normalize-operation-paths semantic-operations))))
          (sources (make-hash-table :test 'equal))
          (destinations (make-hash-table :test 'equal))
          (creates (make-hash-table :test 'equal))
@@ -1841,7 +1882,9 @@ RESERVED-PATHS contains every transaction source and destination."
   "Copy SRC to DST, refusing to overwrite any existing destination."
   (when (grease--path-occupied-p dst)
     (error "Destination already exists: %s" dst))
-  (make-directory (file-name-directory dst) t)
+  (unless (file-directory-p (file-name-directory dst))
+    (error "Destination parent does not exist: %s"
+           (file-name-directory dst)))
   (if (file-directory-p src)
       (copy-directory src dst nil nil t)
     (copy-file src dst nil)))
@@ -1861,7 +1904,9 @@ RESERVED-PATHS contains every transaction source and destination."
       ('create
        (when (grease--path-occupied-p dst)
          (error "Destination already exists: %s" dst))
-       (make-directory (file-name-directory dst) t)
+       (unless (file-directory-p (file-name-directory dst))
+         (error "Destination parent does not exist: %s"
+                (file-name-directory dst)))
        (if (eq (plist-get operation :type) 'dir)
            (make-directory dst nil)
          (write-region "" nil dst nil 'silent nil t)))
@@ -1870,7 +1915,9 @@ RESERVED-PATHS contains every transaction source and destination."
       ('relocate
        (when (grease--path-occupied-p dst)
          (error "Destination already exists: %s" dst))
-       (make-directory (file-name-directory dst) t)
+       (unless (file-directory-p (file-name-directory dst))
+         (error "Destination parent does not exist: %s"
+                (file-name-directory dst)))
        (if (grease--same-filesystem-adapter-p src dst)
            (rename-file src dst nil)
          ;; Cross-filesystem relocation is copy-then-delete.  The source is
@@ -1931,7 +1978,8 @@ state is cleared here; the save coordinator owns transaction commit state."
   "Compatibility wrapper executing positional CHANGES.
 Return the explicit executor result and do not clear any global state."
   (grease--execute-transaction
-   (mapcar #'grease--legacy-change-to-semantic changes)))
+   (grease--plan-transaction
+    (mapcar #'grease--legacy-change-to-semantic changes))))
 
 ;;;; Preview Buffer System
 
@@ -2137,15 +2185,21 @@ be used.  Timers do not reliably run with the Grease buffer current."
     (let ((id (plist-get operation :id))
           (kind (plist-get operation :kind)))
       (pcase kind
-        ('delete (remhash id grease--file-registry))
+        ('delete
+         (when id (remhash id grease--file-registry)))
         ((or 'create 'copy 'relocate)
-         (puthash id
-                  (list :path (plist-get operation :dst)
-                        :type (plist-get operation :type)
-                        :committed-p t
-                        :source-id nil
-                        :exists t)
-                  grease--file-registry))))))
+         (if id
+             (puthash id
+                      (list :path (plist-get operation :dst)
+                            :type (plist-get operation :type)
+                            :committed-p t
+                            :source-id nil
+                            :exists t)
+                      grease--file-registry)
+           (when (and (plist-get operation :implicit-parent-p)
+                      (not (grease--get-id-by-path
+                            (plist-get operation :dst))))
+             (grease--register-file (plist-get operation :dst) 'dir))))))))
 
 (defun grease--clipboard-consumed-p (operations)
   "Return non-nil when OPERATIONS consume the current Grease clipboard."
@@ -2225,7 +2279,7 @@ be used.  Timers do not reliably run with the Grease buffer current."
                    nil)
                (let ((clipboard-consumed
                       (grease--clipboard-consumed-p operations)))
-                 (grease--commit-registry-operations operations)
+                 (grease--commit-registry-operations plan)
                  (when clipboard-consumed
                    (setq grease--clipboard nil))
                  (grease--rerender-live-buffers all-buffers operations)

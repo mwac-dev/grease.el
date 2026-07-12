@@ -1230,6 +1230,62 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
       (should (= 1 (length file-plan)))
       (should (= 1 (length directory-plan))))))
 
+(ert-deftest grease-test-plan-expands-missing-directory-parents ()
+  "Missing parents should become explicit ordered directory creates."
+  (grease-test-with-temp-dir
+    (let* ((parent (expand-file-name "parent" temp-dir))
+           (child (expand-file-name "parent/child" temp-dir))
+           (plan (grease--plan-transaction
+                  `((:kind create :id 10 :dst ,child :type dir)))))
+      (should (= 2 (length plan)))
+      (should (equal (mapcar (lambda (operation) (plist-get operation :dst)) plan)
+                     (list parent child)))
+      (should (plist-get (car plan) :implicit-parent-p))
+      (should (eq (plist-get (car plan) :type) 'dir)))))
+
+(ert-deftest grease-test-plan-expands-all-parents-for-nested-file ()
+  "A nested file create should explicitly plan every missing ancestor."
+  (grease-test-with-temp-dir
+    (let* ((first (expand-file-name "one" temp-dir))
+           (second (expand-file-name "one/two" temp-dir))
+           (file (expand-file-name "one/two/file.txt" temp-dir))
+           (plan (grease--plan-transaction
+                  `((:kind create :id 20 :dst ,file :type file)))))
+      (should (equal (mapcar (lambda (operation) (plist-get operation :dst)) plan)
+                     (list first second file)))
+      (should (equal (mapcar (lambda (operation) (plist-get operation :type)) plan)
+                     '(dir dir file))))))
+
+(ert-deftest grease-test-plan-does-not-duplicate-scheduled-parent ()
+  "An explicit parent create should not gain a duplicate implicit operation."
+  (grease-test-with-temp-dir
+    (let* ((parent (expand-file-name "parent" temp-dir))
+           (child (expand-file-name "parent/child.txt" temp-dir))
+           (plan (grease--plan-transaction
+                  `((:kind create :id 1 :dst ,parent :type dir)
+                    (:kind create :id 2 :dst ,child :type file)))))
+      (should (= 2 (length plan)))
+      (should (= 1 (cl-count parent plan
+                             :key (lambda (operation)
+                                    (plist-get operation :dst))
+                             :test #'equal))))))
+
+(ert-deftest grease-test-plan-rejects-nondirectory-ancestor-before-mutation ()
+  "An occupied file ancestor should abort without running the executor."
+  (grease-test-with-temp-dir
+    (let ((ancestor (expand-file-name "occupied" temp-dir))
+          (executions 0))
+      (write-region "not a directory" nil ancestor)
+      (cl-letf (((symbol-function 'grease--execute-transaction)
+                 (lambda (&rest _) (cl-incf executions))))
+        (should-error
+         (grease--plan-transaction
+          `((:kind create :id 1
+                   :dst ,(expand-file-name "occupied/child.txt" temp-dir)
+                   :type file)))
+         :type 'user-error))
+      (should (= executions 0)))))
+
 (ert-deftest grease-test-plan-orders-parent-directory-creation ()
   "A scheduled parent directory should be created before its child."
   (grease-test-with-temp-dir
@@ -2105,6 +2161,36 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
             (with-current-buffer left
               (should-not (grease-save)))))
         (should prompted)))))
+
+(ert-deftest grease-test-save-nested-directory-through-full-transaction ()
+  "Saving a nested directory should execute its explicit parent plan."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "parent/child/\n"))
+      (let ((grease-skip-confirm-for-simple-edits t))
+        (should (grease-save)))
+      (should (file-directory-p
+               (expand-file-name "parent/child" temp-dir)))
+      (should-not (plist-get
+                   (grease--build-transaction (list (current-buffer)))
+                   :operations)))))
+
+(ert-deftest grease-test-save-nested-file-through-full-transaction ()
+  "Saving a nested file should explicitly create all parent directories."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "one/two/file.txt\n"))
+      (let ((grease-skip-confirm-for-simple-edits t))
+        (should (grease-save)))
+      (should (file-exists-p
+               (expand-file-name "one/two/file.txt" temp-dir)))
+      (should-not (plist-get
+                   (grease--build-transaction (list (current-buffer)))
+                   :operations)))))
 
 (ert-deftest grease-test-save-typed-directory-through-full-transaction ()
   "Typing test/ and saving should create the directory through the planner."
