@@ -679,22 +679,100 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
       (let ((changes (grease--calculate-changes)))
         (should (cl-find-if (lambda (c) (eq (car c) :create)) changes))))))
 
-;;;; Rename Detection Tests
+;;;; ID-Based Diff Tests
 
-(ert-deftest grease-test-check-for-renames ()
-  "Test rename detection logic."
-  (grease-test-with-clean-state
-    (grease-test-with-temp-dir
-      (let* ((old-path (expand-file-name "oldname.txt" temp-dir))
-             (new-name "newname.txt")
-             (id (grease--register-file old-path 'file))
-             (original-state (make-hash-table :test 'equal))
-             (new-entries `((:name ,new-name :id ,id))))
-        (setq grease--root-dir (file-name-as-directory temp-dir))
-        (puthash "oldname.txt" 'file original-state)
-        (let ((renames (grease--check-for-renames new-entries original-state)))
-          (should (= 1 (length renames)))
-          (should (eq (caar renames) :rename)))))))
+(defun grease-test-baseline (&rest entries)
+  "Return an ID-keyed baseline hash table containing ENTRIES."
+  (let ((baseline (make-hash-table :test 'eql)))
+    (dolist (entry entries baseline)
+      (puthash (plist-get entry :id) entry baseline))))
+
+(ert-deftest grease-test-diff-by-id-file-rename ()
+  "A committed file at a new path should produce one relocation."
+  (let* ((baseline (grease-test-baseline
+                    '(:id 1 :path "/tmp/old.txt" :type file :committed-p t)))
+         (current '((:id 1 :path "/tmp/new.txt" :type file :committed-p t))))
+    (should (grease-test-operations-equal-p
+             (grease--diff-by-id baseline current)
+             '((:kind relocate :id 1 :src "/tmp/old.txt"
+                      :dst "/tmp/new.txt" :type file))))))
+
+(ert-deftest grease-test-diff-by-id-directory-rename ()
+  "A committed directory at a new path should produce one relocation."
+  (let* ((baseline (grease-test-baseline
+                    '(:id 4 :path "/tmp/old" :type dir :committed-p t)))
+         (current '((:id 4 :path "/tmp/new" :type dir :committed-p t))))
+    (should (grease-test-operations-equal-p
+             (grease--diff-by-id baseline current)
+             '((:kind relocate :id 4 :src "/tmp/old"
+                      :dst "/tmp/new" :type dir))))))
+
+(ert-deftest grease-test-diff-by-id-two-way-swap ()
+  "Two identities swapping occupied names should both relocate."
+  (let* ((baseline (grease-test-baseline
+                    '(:id 1 :path "/tmp/a" :type file :committed-p t)
+                    '(:id 2 :path "/tmp/b" :type file :committed-p t)))
+         (current '((:id 1 :path "/tmp/b" :type file :committed-p t)
+                    (:id 2 :path "/tmp/a" :type file :committed-p t))))
+    (should (grease-test-operations-equal-p
+             (grease--diff-by-id baseline current)
+             '((:kind relocate :id 1 :src "/tmp/a" :dst "/tmp/b" :type file)
+               (:kind relocate :id 2 :src "/tmp/b" :dst "/tmp/a" :type file))))))
+
+(ert-deftest grease-test-diff-by-id-three-way-rotation ()
+  "Three identities rotating names should retain their destination mapping."
+  (let* ((baseline (grease-test-baseline
+                    '(:id 1 :path "/tmp/a" :type file :committed-p t)
+                    '(:id 2 :path "/tmp/b" :type file :committed-p t)
+                    '(:id 3 :path "/tmp/c" :type file :committed-p t)))
+         (current '((:id 1 :path "/tmp/b" :type file :committed-p t)
+                    (:id 2 :path "/tmp/c" :type file :committed-p t)
+                    (:id 3 :path "/tmp/a" :type file :committed-p t))))
+    (should (grease-test-operations-equal-p
+             (grease--diff-by-id baseline current)
+             '((:kind relocate :id 1 :src "/tmp/a" :dst "/tmp/b" :type file)
+               (:kind relocate :id 2 :src "/tmp/b" :dst "/tmp/c" :type file)
+               (:kind relocate :id 3 :src "/tmp/c" :dst "/tmp/a" :type file))))))
+
+(ert-deftest grease-test-diff-by-id-create-copy-delete-and-unchanged ()
+  "The identity diff should classify all non-relocation cases correctly."
+  (let* ((baseline (grease-test-baseline
+                    '(:id 1 :path "/tmp/source" :type file :committed-p t)
+                    '(:id 2 :path "/tmp/delete" :type file :committed-p t)
+                    '(:id 3 :path "/tmp/same" :type dir :committed-p t)))
+         (current '((:id 1 :path "/tmp/source" :type file :committed-p t)
+                    (:id 3 :path "/tmp/same" :type dir :committed-p t)
+                    (:id 4 :path "/tmp/new" :type file :committed-p nil)
+                    (:id 5 :path "/tmp/copied" :type file :committed-p nil
+                         :source-id 1)))
+         (expected '((:kind delete :id 2 :src "/tmp/delete" :type file)
+                     (:kind create :id 4 :dst "/tmp/new" :type file)
+                     (:kind copy :id 5 :source-id 1 :src "/tmp/source"
+                            :dst "/tmp/copied" :type file))))
+    (should (grease-test-operations-equal-p
+             (grease--diff-by-id baseline current)
+             expected))))
+
+(ert-deftest grease-test-diff-by-id-does-not-consult-filename-occupancy ()
+  "Relocation detection should depend on identity, not occupied names."
+  (let* ((baseline (grease-test-baseline
+                    '(:id 10 :path "/tmp/foo" :type dir :committed-p t)
+                    '(:id 20 :path "/tmp/bar" :type dir :committed-p t)))
+         (current '((:id 10 :path "/tmp/bar" :type dir :committed-p t)
+                    (:id 20 :path "/tmp/foo" :type dir :committed-p t)))
+         (operations (grease--diff-by-id baseline current)))
+    (should (equal (plist-get
+                    (cl-find 10 operations
+                             :key (lambda (operation)
+                                    (plist-get operation :id)))
+                    :dst)
+                   "/tmp/bar"))
+    (should (equal (plist-get
+                    (cl-find 20 operations
+                             :key (lambda (operation)
+                                    (plist-get operation :id)))
+                    :dst)
+                   "/tmp/foo"))))
 
 ;;;; Clipboard Tests
 

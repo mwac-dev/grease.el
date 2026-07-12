@@ -1268,15 +1268,25 @@ Runs BEFORE Evil's delete (which will also yank)."
                    (full-path (plist-get line-data :full-path))
                    (is-new (plist-get line-data :is-new))
                    (registry-entry (and id (grease--get-file-by-id id)))
+                   (effective-source-id
+                    (or source-id
+                        (and registry-entry
+                             (plist-get registry-entry :source-id))))
+                   (source-entry
+                    (and effective-source-id
+                         (grease--get-file-by-id effective-source-id)))
                    (data (list :name name
                                :path full-path
                                :type type
                                :id id
                                :committed-p (and registry-entry
                                                  (plist-get registry-entry :committed-p))
-                               :source-id (or source-id
-                                              (and registry-entry
-                                                   (plist-get registry-entry :source-id)))
+                               :source-id effective-source-id
+                               :source-path (and source-entry
+                                                 (plist-get source-entry :path))
+                               :source-committed-p
+                               (and source-entry
+                                    (plist-get source-entry :committed-p))
                                :is-duplicate is-duplicate
                                :full-path full-path
                                :is-new is-new)))
@@ -1393,145 +1403,102 @@ Return a list of conflicting names."
           (puthash name (1+ count) names))))
     (cl-remove-duplicates conflicts :test #'equal)))
 
-(defun grease--check-for-renames (new-entries original-state)
-  "Detect file renames by comparing NEW-ENTRIES with ORIGINAL-STATE.
-Returns a list of rename operations to be performed."
-  (let ((renames '())
-        (seen-ids (make-hash-table :test 'eql))
-        (seen-names (make-hash-table :test 'equal)))
-    
-    ;; First mark all IDs that are still present
-    (dolist (entry new-entries)
-      (let ((id (plist-get entry :id))
-            (name (plist-get entry :name)))
-        (when id
-          (puthash id name seen-ids)
-          (puthash name t seen-names))))
-    
-    ;; Check for files that had their name changed but ID preserved
-    (maphash (lambda (orig-name _orig-type)
-               (let* ((orig-path (grease--get-full-path orig-name))
-                      (id (grease--get-id-by-path orig-path)))
-                 (when id
-                   (let ((new-name (gethash id seen-ids)))
-                     (when (and new-name 
-                                (not (equal new-name orig-name))
-                                (not (gethash orig-name seen-names)))
-                       ;; Found a rename: same ID, different name, old name not present
-                       (let ((old-path (grease--get-full-path orig-name))
-                             (new-path (grease--get-full-path new-name)))
-                         (push `(:rename ,old-path ,new-path) renames)))))))
-             original-state)
-    
-    renames))
+(defun grease--diff-by-id (baseline current-entries)
+  "Return semantic operations between BASELINE and CURRENT-ENTRIES.
+BASELINE is a hash table keyed by stable file ID.  This function is pure:
+it reads only its arguments and never examines or mutates the filesystem."
+  (let ((current-by-id (make-hash-table :test 'eql))
+        operations)
+    (dolist (entry current-entries)
+      (when-let ((id (plist-get entry :id)))
+        (puthash id entry current-by-id)))
+
+    ;; Existing identities are either unchanged, relocated, or deleted.
+    (maphash
+     (lambda (id original)
+       (let ((current (gethash id current-by-id)))
+         (cond
+          ((not current)
+           (push (list :kind 'delete
+                       :id id
+                       :src (plist-get original :path)
+                       :type (plist-get original :type))
+                 operations))
+          ((not (equal (plist-get original :path)
+                       (plist-get current :path)))
+           (push (list :kind 'relocate
+                       :id id
+                       :src (plist-get original :path)
+                       :dst (plist-get current :path)
+                       :type (plist-get current :type))
+                 operations)))))
+     baseline)
+
+    ;; Identities absent from the baseline are creates or copies.
+    (dolist (entry current-entries)
+      (let* ((id (plist-get entry :id))
+             (source-id (plist-get entry :source-id)))
+        (unless (gethash id baseline)
+          (let* ((source-baseline (and source-id (gethash source-id baseline)))
+                 (source-path (or (and source-baseline
+                                       (plist-get source-baseline :path))
+                                  (plist-get entry :source-path)))
+                 (source-committed-p
+                  (or (and source-baseline
+                           (plist-get source-baseline :committed-p))
+                      (plist-get entry :source-committed-p))))
+            (if (and source-id source-path source-committed-p)
+                (push (list :kind 'copy
+                            :id id
+                            :source-id source-id
+                            :src source-path
+                            :dst (plist-get entry :path)
+                            :type (plist-get entry :type))
+                      operations)
+              (push (list :kind 'create
+                          :id id
+                          :dst (plist-get entry :path)
+                          :type (plist-get entry :type))
+                    operations))))))
+    (nreverse operations)))
+
+(defun grease--semantic-operation-to-legacy (operation)
+  "Convert semantic OPERATION to the positional executor format.
+This compatibility adapter can be removed when the transaction executor
+accepts named operation plists directly."
+  (pcase (plist-get operation :kind)
+    ('create
+     (let ((path (plist-get operation :dst)))
+       (list :create (if (eq (plist-get operation :type) 'dir)
+                         (file-name-as-directory path)
+                       path))))
+    ('delete (list :delete (plist-get operation :src)))
+    ('copy (list :copy (plist-get operation :src) (plist-get operation :dst)))
+    ('relocate
+     (let ((src (plist-get operation :src))
+           (dst (plist-get operation :dst)))
+       (list (if (equal (file-name-directory src)
+                        (file-name-directory dst))
+                 :rename
+               :move)
+             src dst)))
+    (kind (error "Unknown semantic operation kind %S" kind))))
 
 (defun grease--calculate-changes ()
-  "Calculate the changes between original state and current buffer."
+  "Calculate current buffer changes using stable file identities."
   (let* ((entries (grease--scan-buffer))
-         (changes '())
-         (original-files (copy-hash-table grease--original-state))
-         (seen-originals (make-hash-table :test 'equal))
-         (seen-ids (make-hash-table :test 'eql))
-         ;; detect conflicts first
-         (name-conflicts (grease--detect-name-conflicts entries))
-         (renames (grease--check-for-renames entries original-files)))
-
-    ;; Abort immediately if name conflicts exist
+         (name-conflicts (grease--detect-name-conflicts entries)))
     (when name-conflicts
       (user-error "Filename conflicts detected in this directory: %s"
                   (mapconcat #'identity name-conflicts ", ")))
-
-    ;; Add detected renames to changes
-    (setq changes (append renames changes))
-
-    ;; First process current buffer entries
-    (dolist (entry entries)
-      (let ((name (plist-get entry :name))
-            (type (plist-get entry :type))
-            (id (plist-get entry :id))
-            (source-id (plist-get entry :source-id))
-            (is-duplicate (plist-get entry :is-duplicate))
-            (full-path (plist-get entry :full-path))
-            (is-new (plist-get entry :is-new)))
-
-        ;; Track this ID as seen
-        (when id
-          (puthash id t seen-ids))
-
-        ;; Track this name as seen in original files (if it exists there)
-        (when (gethash name original-files)
-          (puthash name t seen-originals))
-
-        (cond
-         ;; Skip files that are part of rename operations
-         ((cl-find-if (lambda (change)
-                        (and (eq (car change) :rename)
-                             (equal (grease--get-full-path name) (nth 2 change))))
-                      renames))
-
-         ;; Case 1: Entry copied from another line via source-id.  If the
-         ;; source is a real filesystem entry, copy it.  If the source was a
-         ;; pending/new line, treat this as another create instead of trying to
-         ;; copy a file that does not exist yet.
-         ((and source-id (not (eq source-id id)))
-          (let* ((source-info (grease--get-file-by-id source-id))
-                 (source-path (plist-get source-info :path))
-                 (dst-path (grease--get-full-path name)))
-            (if (and source-path (grease--real-file-id-p source-id))
-                (push `(:copy ,source-path ,dst-path) changes)
-              (push `(:create ,(grease--get-create-path name type)) changes))))
-
-         ;; Case 2: A duplicated line within the same directory
-         (is-duplicate
-          (let* ((matching-entries
-                  (cl-remove-if-not
-                   (lambda (e)
-                     (and (string= (plist-get e :name) name)
-                          (not (plist-get e :is-duplicate))))
-                   entries))
-                 (source-entry (car matching-entries))
-                 (source-entry-id (plist-get source-entry :id))
-                 (source-path (and source-entry
-                                   (grease--get-full-path (plist-get source-entry :name))))
-                 (dst-path (grease--get-full-path name)))
-            (when source-entry
-              (if (and source-path (grease--real-file-id-p source-entry-id))
-                  (push `(:copy ,source-path ,dst-path) changes)
-                (push `(:create ,(grease--get-create-path name type)) changes)))))
-
-         ;; Case 3: Was this file previously deleted and moved here?
-         ((and id (gethash id grease--deleted-file-ids))
-          (let ((src-path (gethash id grease--deleted-file-ids))
-                (dst-path (grease--get-full-path name)))
-            (when (and src-path (not (equal src-path dst-path)))
-              ;; This is a moved file - add as move operation
-              (push `(:move ,src-path ,dst-path) changes))))
-
-         ;; Case 4: A newly created file or directory
-         (is-new
-          (push `(:create ,(grease--get-create-path name type)) changes))
-
-         ;; Case 6: New file/directory that doesn't match original state and isn't a rename
-         ((not (gethash name original-files))
-          (push `(:create ,(grease--get-create-path name type)) changes)))))
-
-    ;; Process deletions - any original file not seen in the current buffer
-    (maphash (lambda (name type)
-               (unless (gethash name seen-originals)
-                 (let* ((path (grease--get-full-path name))
-                        (id (grease--get-id-by-path path)))
-                   ;; Skip if the file was renamed or moved
-                   (unless (or (and id (gethash id seen-ids))
-                               (cl-find-if (lambda (change)
-                                            (and (eq (car change) :rename)
-                                                 (equal path (nth 1 change))))
-                                          renames))
-                     ;; File was deleted
-                     (push `(:delete ,path) changes)))))
-             original-files)
-
-    ;; Sort changes for consistent application order (deletes first)
-    (sort changes (lambda (a b) (if (eq (car a) :delete) t (not (eq (car b) :delete)))))))
+    (let ((changes
+           (mapcar #'grease--semantic-operation-to-legacy
+                   (grease--diff-by-id grease--baseline-by-id entries))))
+      ;; Preserve the old executor's deterministic deletion-first behavior.
+      (sort changes
+            (lambda (left right)
+              (and (eq (car left) :delete)
+                   (not (eq (car right) :delete))))))))
 
 (defun grease--apply-changes (changes)
   "Apply CHANGES to the filesystem."
