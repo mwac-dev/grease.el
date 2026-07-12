@@ -1657,6 +1657,55 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
     (should (string-match-p "\\[Rename\\].*->"
                             (grease--format-change '(:rename "/tmp/test/a.txt" "/tmp/test/b.txt"))))))
 
+(ert-deftest grease-test-format-semantic-directory-create-shows-slash ()
+  "Directory creates should be visibly distinct in confirmation text."
+  (let ((grease--root-dir "/tmp/test/"))
+    (should (equal
+             (grease--format-semantic-operation
+              '(:kind create :id 1 :dst "/tmp/test/new-dir" :type dir))
+             "  [Create] new-dir/"))))
+
+(ert-deftest grease-test-format-semantic-file-create-has-no-slash ()
+  "File creates should not receive a directory display slash."
+  (let ((grease--root-dir "/tmp/test/"))
+    (should (equal
+             (grease--format-semantic-operation
+              '(:kind create :id 1 :dst "/tmp/test/new-file" :type file))
+             "  [Create] new-file"))))
+
+(ert-deftest grease-test-format-semantic-directory-operations-show-slashes ()
+  "Directory delete, rename, move, and copy paths should all show slashes."
+  (let ((grease--root-dir "/tmp/test/"))
+    (dolist (case
+             '(((:kind delete :id 1 :src "/tmp/test/old" :type dir)
+                . "  [Delete] old/")
+               ((:kind relocate :id 1 :src "/tmp/test/old" :dst "/tmp/test/new"
+                       :type dir)
+                . "  [Rename] old/ -> new/")
+               ((:kind relocate :id 1 :src "/tmp/test/old"
+                       :dst "/tmp/elsewhere/new" :type dir)
+                . "  [Move]   old/ -> /tmp/elsewhere/new/")
+               ((:kind copy :id 2 :source-id 1 :src "/tmp/test/source"
+                       :dst "/tmp/test/copy" :type dir)
+                . "  [Copy]   source/ -> copy/")))
+      (should (equal (grease--format-semantic-operation (car case))
+                     (cdr case))))))
+
+(ert-deftest grease-test-save-confirmation-shows-directory-slash ()
+  "The unified save prompt should use type-aware directory presentation."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert "test/\n"))
+      (let (captured-prompt)
+        (cl-letf (((symbol-function 'read-char-choice)
+                   (lambda (prompt &rest _)
+                     (setq captured-prompt prompt)
+                     ?n)))
+          (should-not (grease-save)))
+        (should (string-match-p "\\[Create\\] test/" captured-prompt))))))
+
 ;;;; Cursor Constraint Tests
 
 (ert-deftest grease-test-count-file-lines ()

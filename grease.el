@@ -1340,6 +1340,37 @@ Runs BEFORE Evil's delete (which will also yank)."
              (grease--relative-path src)
              (grease--relative-path dst)))))
 
+(defun grease--format-semantic-path (path type)
+  "Format PATH relative to the current root, showing a slash for directory TYPE."
+  (let ((display-path (grease--relative-path path)))
+    (if (eq type 'dir)
+        (file-name-as-directory display-path)
+      display-path)))
+
+(defun grease--format-semantic-operation (operation)
+  "Format semantic OPERATION for a type-aware confirmation prompt."
+  (let ((kind (plist-get operation :kind))
+        (type (plist-get operation :type))
+        (src (plist-get operation :src))
+        (dst (plist-get operation :dst)))
+    (pcase kind
+      ('create
+       (format "  [Create] %s" (grease--format-semantic-path dst type)))
+      ('delete
+       (format "  [Delete] %s" (grease--format-semantic-path src type)))
+      ('relocate
+       (format (if (equal (file-name-directory src)
+                          (file-name-directory dst))
+                   "  [Rename] %s -> %s"
+                 "  [Move]   %s -> %s")
+               (grease--format-semantic-path src type)
+               (grease--format-semantic-path dst type)))
+      ('copy
+       (format "  [Copy]   %s -> %s"
+               (grease--format-semantic-path src type)
+               (grease--format-semantic-path dst type)))
+      (_ (format "  [Unknown] %S" operation)))))
+
 (defun grease--same-filesystem-adapter-p (src dst)
   "Return non-nil when SRC and DST use the same local/remote adapter."
   (equal (file-remote-p src) (file-remote-p dst)))
@@ -2259,7 +2290,7 @@ be used.  Timers do not reliably run with the Grease buffer current."
                  (format
                   (concat "Apply all staged Grease-buffer changes? "
                           "(y=yes, n=cancel, d=discard all)\n%s\n")
-                  (mapconcat #'grease--format-change display-changes "\n"))
+                  (mapconcat #'grease--format-semantic-operation operations "\n"))
                  '(?y ?n ?d)))))
         (pcase choice
           (?n
