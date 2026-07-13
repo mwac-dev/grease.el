@@ -52,6 +52,21 @@ If non-nil, the window existed before grease and should be restored on close.")
   "When non-nil, preview buffer for files is writable.
 Does not apply to directories.")
 
+;;; Symlink display toggle & faces
+
+(defcustom grease-show-symlink-targets t
+  "When non-nil, show resolved symlink targets next to symlink entries.
+If nil, symlink entries are shown as regular files/dirs without
+the resolved target."
+  :type 'boolean
+  :group 'grease)
+
+(defface grease-symlink-broken
+  '((t :foreground "#ef4444" :background nil))
+  "Face for the resolved target of a broken symlink.
+Used when the symlink target does not exist on the filesystem."
+  :group 'grease)
+
 (defcustom grease-skip-confirm-for-simple-edits nil
   "When non-nil, save simple edits without asking for confirmation.
 A simple edit has no deletes, at most five creates, at most one copy,
@@ -320,21 +335,21 @@ creates a directory rather than an empty file."
   "Format ID as a 3-digit string with leading zeroes."
   (format "%03d" id))
 
+
 (defun grease--extract-filename (text)
-  "Extract just the filename from TEXT, removing ID and icon."
-  ;; First try to match with hidden ID format
-  (if (string-match (concat "^" grease--id-prefix "[0-9]+\\s-+\\(.*\\)$") text)
-      ;; Got the text after the ID, now extract just the filename (after any icon)
-      (let ((content (match-string 1 text)))
-        ;; Look for the first alphanumeric or allowed special char that starts the filename
-        (if (string-match "\\(?:[^\n[:alnum:]/._+-]\\s-*\\)*\\([[:alnum:]/._+-].*\\)$" content)
-            (match-string 1 content)
-          content)) ;; Fallback to the whole content
-    ;; No ID, try to extract filename directly
-    (if (string-match "\\(?:[^\n[:alnum:]/._+-]\\s-*\\)*\\([[:alnum:]/._+-].*\\)$" text)
-        (match-string 1 text)
-      ;; Last resort fallback
-      (string-trim text))))
+  "Extract just the filename from TEXT, removing ID, icon, and symlink suffix."
+  (let* ((filename
+          (if (string-match (concat "^" grease--id-prefix "[0-9]+\\s-+\\(.*\\)$") text)
+              (let ((content (match-string 1 text)))
+                (if (string-match "\\(?:[^\n[:alnum:]/._+-]\\s-*\\)*\\([[:alnum:]/._+-].*\\)$" content)
+                    (match-string 1 content)
+                  content))
+            (if (string-match "\\(?:[^\n[:alnum:]/._+-]\\s-*\\)*\\([[:alnum:]/._+-].*\\)$" text)
+                (match-string 1 text)
+              (string-trim text)))))
+    (if (string-match "" filename)
+        (string-trim-right (substring filename 0 (match-beginning 0)))
+      filename)))
 
 (defun grease--extract-id (text)
   "Extract the file ID from TEXT if present."
@@ -604,7 +619,24 @@ IS-DUPLICATE indicates if this is a copy of another file."
                                 'grease-full-path full-path))
 
       ;; Add face to the name part only
-      (put-text-property name-start (point) 'face 'font-lock-function-name-face))
+      (put-text-property name-start (point) 'face 'font-lock-function-name-face)
+
+      ;; Optionally append symlink target (unless disabled)
+      (when (and grease-show-symlink-targets
+                 (file-symlink-p full-path))
+        (let* ((link-target (file-symlink-p full-path))
+               (resolved (expand-file-name link-target
+                                           (file-name-directory full-path)))
+               (target-face (if (file-exists-p resolved)
+                                'font-lock-comment-face
+                              'grease-symlink-broken)))
+          (insert " ")
+          (let ((mark-start (point)))
+            (insert " ")
+            (put-text-property mark-start (point) 'face target-face))
+          (let ((target-start (point)))
+            (insert resolved)
+            (put-text-property target-start (point) 'face target-face)))))
 
     (insert "\n")))
 
@@ -1157,28 +1189,26 @@ Runs BEFORE Evil's delete (which will also yank)."
   (when (derived-mode-p 'grease-mode)
     (save-excursion
       (goto-char (point-min))
-      (forward-line 1) ; Skip header
+      (forward-line 1)
       (while (not (eobp))
         (let* ((line-beg (line-beginning-position))
                (line-end (line-end-position))
                (line-data (grease--get-line-data (point))))
-
-          ;; Only process lines with our metadata
           (when line-data
-            (let* ((visible-text (buffer-substring-no-properties
-                                  line-beg line-end))
+            (let* ((old-path (get-text-property line-beg 'grease-full-path))
+                   (visible-text (buffer-substring-no-properties line-beg line-end))
                    (clean-text (grease--extract-filename visible-text))
                    (is-dir (grease--is-dir-name clean-text))
-                  (name (grease--canonical-entry-name clean-text))
-                  (type (if is-dir 'dir 'file))
+                   (name (grease--canonical-entry-name clean-text))
+                   (type (if is-dir 'dir 'file))
                    (full-path (grease--get-full-path name)))
-
-              ;; Update text properties with new name
               (when (get-text-property line-beg 'grease-name)
                 (put-text-property line-beg line-end 'grease-name name)
                 (put-text-property line-beg line-end 'grease-type type)
-                (put-text-property line-beg line-end 'grease-full-path full-path)))))
-
+                (put-text-property line-beg line-end 'grease-full-path full-path)
+                (unless (equal old-path full-path)
+                  (message "grease--update-line-metadata: line=%d old=%s new=%s path-changed"
+                           (line-number-at-pos) old-path full-path))))))
         (forward-line 1)))))
 
 (defun grease--format-plain-lines ()
@@ -1425,37 +1455,27 @@ Return a list of conflicting names."
     (cl-remove-duplicates conflicts :test #'equal)))
 
 (defun grease--diff-by-id (baseline current-entries)
-  "Return semantic operations between BASELINE and CURRENT-ENTRIES.
-BASELINE is a hash table keyed by stable file ID.  This function is pure:
-it reads only its arguments and never examines or mutates the filesystem."
-  (let ((current-by-id (make-hash-table :test 'eql))
-        operations)
+  "Return semantic operations between BASELINE and CURRENT-ENTRIES."
+  (let ((current-by-id (make-hash-table :test 'eql)) operations)
     (dolist (entry current-entries)
       (when-let ((id (plist-get entry :id)))
         (puthash id entry current-by-id)))
-
-    ;; Existing identities are either unchanged, relocated, or deleted.
     (maphash
      (lambda (id original)
        (let ((current (gethash id current-by-id)))
          (cond
           ((not current)
-           (push (list :kind 'delete
-                       :id id
-                       :src (plist-get original :path)
+           (push (list :kind 'delete :id id :src (plist-get original :path)
                        :type (plist-get original :type))
                  operations))
           ((not (equal (plist-get original :path)
                        (plist-get current :path)))
-           (push (list :kind 'relocate
-                       :id id
+           (push (list :kind 'relocate :id id
                        :src (plist-get original :path)
                        :dst (plist-get current :path)
                        :type (plist-get current :type))
                  operations)))))
      baseline)
-
-    ;; Identities absent from the baseline are creates or copies.
     (dolist (entry current-entries)
       (let* ((id (plist-get entry :id))
              (source-id (plist-get entry :source-id)))
@@ -1469,15 +1489,11 @@ it reads only its arguments and never examines or mutates the filesystem."
                            (plist-get source-baseline :committed-p))
                       (plist-get entry :source-committed-p))))
             (if (and source-id source-path source-committed-p)
-                (push (list :kind 'copy
-                            :id id
-                            :source-id source-id
-                            :src source-path
-                            :dst (plist-get entry :path)
+                (push (list :kind 'copy :id id :source-id source-id
+                            :src source-path :dst (plist-get entry :path)
                             :type (plist-get entry :type))
                       operations)
-              (push (list :kind 'create
-                          :id id
+              (push (list :kind 'create :id id
                           :dst (plist-get entry :path)
                           :type (plist-get entry :type))
                     operations))))))
