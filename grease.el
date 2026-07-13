@@ -337,19 +337,20 @@ creates a directory rather than an empty file."
 
 
 (defun grease--extract-filename (text)
-  "Extract just the filename from TEXT, removing ID, icon, and symlink suffix."
-  (let* ((filename
-          (if (string-match (concat "^" grease--id-prefix "[0-9]+\\s-+\\(.*\\)$") text)
-              (let ((content (match-string 1 text)))
-                (if (string-match "\\(?:[^\n[:alnum:]/._+-]\\s-*\\)*\\([[:alnum:]/._+-].*\\)$" content)
-                    (match-string 1 content)
-                  content))
-            (if (string-match "\\(?:[^\n[:alnum:]/._+-]\\s-*\\)*\\([[:alnum:]/._+-].*\\)$" text)
-                (match-string 1 text)
-              (string-trim text)))))
-    (if (string-match "" filename)
-        (string-trim-right (substring filename 0 (match-beginning 0)))
-      filename)))
+  "Extract just the filename from TEXT, removing ID and icon."
+  ;; First try to match with hidden ID format
+  (if (string-match (concat "^" grease--id-prefix "[0-9]+\\s-+\\(.*\\)$") text)
+      ;; Got the text after the ID, now extract just the filename (after any icon)
+      (let ((content (match-string 1 text)))
+        ;; Look for the first alphanumeric or allowed special char that starts the filename
+        (if (string-match "\\(?:[^\n[:alnum:]/._+-]\\s-*\\)*\\([[:alnum:]/._+-].*\\)$" content)
+            (match-string 1 content)
+          content)) ;; Fallback to the whole content
+    ;; No ID, try to extract filename directly
+    (if (string-match "\\(?:[^\n[:alnum:]/._+-]\\s-*\\)*\\([[:alnum:]/._+-].*\\)$" text)
+        (match-string 1 text)
+      ;; Last resort fallback
+      (string-trim text))))
 
 (defun grease--extract-id (text)
   "Extract the file ID from TEXT if present."
@@ -619,9 +620,13 @@ IS-DUPLICATE indicates if this is a copy of another file."
                                 'grease-full-path full-path))
 
       ;; Add face to the name part only
-      (put-text-property name-start (point) 'face 'font-lock-function-name-face)
+      (put-text-property name-start (point) 'face 'font-lock-function-name-face))
 
-      ;; Optionally append symlink target (unless disabled)
+    (let ((eol (line-end-position)))
+      (insert "\n")
+
+      ;; Optionally display symlink target via a display-only overlay
+      ;; anchored on the last character of the filename.
       (when (and grease-show-symlink-targets
                  (file-symlink-p full-path))
         (let* ((link-target (file-symlink-p full-path))
@@ -629,16 +634,12 @@ IS-DUPLICATE indicates if this is a copy of another file."
                                            (file-name-directory full-path)))
                (target-face (if (file-exists-p resolved)
                                 'font-lock-comment-face
-                              'grease-symlink-broken)))
-          (insert " ")
-          (let ((mark-start (point)))
-            (insert " ")
-            (put-text-property mark-start (point) 'face target-face))
-          (let ((target-start (point)))
-            (insert resolved)
-            (put-text-property target-start (point) 'face target-face)))))
-
-    (insert "\n")))
+                              'grease-symlink-broken))
+               (suffix (propertize (concat "  " resolved)
+                                   'face target-face)))
+          (let ((ov (make-overlay (1- eol) eol)))
+            (overlay-put ov 'after-string suffix)
+            (overlay-put ov 'grease-symlink-display t)))))))
 
 
 (defun grease--save-position ()
@@ -695,6 +696,9 @@ If target exceeds available files, go to last file line."
     (setq grease--root-dir (file-name-as-directory (expand-file-name dir)))
     (grease--register-directory grease--root-dir)
     (erase-buffer)
+    ;; erase-buffer does not delete overlays; remove stale ones now
+    (dolist (ov (overlays-in (point-min) (point-max)))
+      (delete-overlay ov))
     (setq grease--original-state (make-hash-table :test 'equal))
     (setq grease--baseline-by-id (make-hash-table :test 'eql))
     (unless keep-changes
@@ -734,6 +738,32 @@ If target exceeds available files, go to last file line."
     (let ((start (point)))
       (insert "\n")
       (put-text-property start (point) 'grease-editable t))))
+
+;;;; Symlink Overlay Lifecycle
+
+(defun grease--refresh-symlink-overlay (line-beg line-end full-path)
+  "Refresh the symlink display overlay on the line between LINE-BEG and LINE-END.
+If FULL-PATH is a symlink and `grease-show-symlink-targets' is non-nil,
+create a display-only overlay anchored on the last character of the line.
+Otherwise, remove any existing symlink overlay."
+  ;; Remove any existing symlink overlay on this line
+  (dolist (ov (overlays-in line-beg line-end))
+    (when (overlay-get ov 'grease-symlink-display)
+      (delete-overlay ov)))
+  ;; Create new overlay if conditions are met
+  (when (and grease-show-symlink-targets
+             (file-symlink-p full-path))
+    (let* ((link-target (file-symlink-p full-path))
+           (resolved (expand-file-name link-target
+                                       (file-name-directory full-path)))
+           (target-face (if (file-exists-p resolved)
+                            'font-lock-comment-face
+                          'grease-symlink-broken))
+           (suffix (propertize (concat "  " resolved)
+                               'face target-face)))
+      (let ((ov (make-overlay (1- line-end) line-end)))
+        (overlay-put ov 'after-string suffix)
+        (overlay-put ov 'grease-symlink-display t)))))
 
 
 ;;;; Cursor Control and Evil Integration
@@ -1206,9 +1236,8 @@ Runs BEFORE Evil's delete (which will also yank)."
                 (put-text-property line-beg line-end 'grease-name name)
                 (put-text-property line-beg line-end 'grease-type type)
                 (put-text-property line-beg line-end 'grease-full-path full-path)
-                (unless (equal old-path full-path)
-                  (message "grease--update-line-metadata: line=%d old=%s new=%s path-changed"
-                           (line-number-at-pos) old-path full-path))))))
+                ;; Refresh symlink display overlay
+                (grease--refresh-symlink-overlay line-beg line-end full-path)))))
         (forward-line 1)))))
 
 (defun grease--format-plain-lines ()
@@ -1455,27 +1484,37 @@ Return a list of conflicting names."
     (cl-remove-duplicates conflicts :test #'equal)))
 
 (defun grease--diff-by-id (baseline current-entries)
-  "Return semantic operations between BASELINE and CURRENT-ENTRIES."
-  (let ((current-by-id (make-hash-table :test 'eql)) operations)
+  "Return semantic operations between BASELINE and CURRENT-ENTRIES.
+BASELINE is a hash table keyed by stable file ID.  This function is pure:
+it reads only its arguments and never examines or mutates the filesystem."
+  (let ((current-by-id (make-hash-table :test 'eql))
+        operations)
     (dolist (entry current-entries)
       (when-let ((id (plist-get entry :id)))
         (puthash id entry current-by-id)))
+
+    ;; Existing identities are either unchanged, relocated, or deleted.
     (maphash
      (lambda (id original)
        (let ((current (gethash id current-by-id)))
          (cond
           ((not current)
-           (push (list :kind 'delete :id id :src (plist-get original :path)
+           (push (list :kind 'delete
+                       :id id
+                       :src (plist-get original :path)
                        :type (plist-get original :type))
                  operations))
           ((not (equal (plist-get original :path)
                        (plist-get current :path)))
-           (push (list :kind 'relocate :id id
+           (push (list :kind 'relocate
+                       :id id
                        :src (plist-get original :path)
                        :dst (plist-get current :path)
                        :type (plist-get current :type))
                  operations)))))
      baseline)
+
+    ;; Identities absent from the baseline are creates or copies.
     (dolist (entry current-entries)
       (let* ((id (plist-get entry :id))
              (source-id (plist-get entry :source-id)))
@@ -1489,11 +1528,15 @@ Return a list of conflicting names."
                            (plist-get source-baseline :committed-p))
                       (plist-get entry :source-committed-p))))
             (if (and source-id source-path source-committed-p)
-                (push (list :kind 'copy :id id :source-id source-id
-                            :src source-path :dst (plist-get entry :path)
+                (push (list :kind 'copy
+                            :id id
+                            :source-id source-id
+                            :src source-path
+                            :dst (plist-get entry :path)
                             :type (plist-get entry :type))
                       operations)
-              (push (list :kind 'create :id id
+              (push (list :kind 'create
+                          :id id
                           :dst (plist-get entry :path)
                           :type (plist-get entry :type))
                     operations))))))
