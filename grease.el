@@ -612,34 +612,20 @@ IS-DUPLICATE indicates if this is a copy of another file."
 
       ;; Store metadata as text properties on the whole line
       (add-text-properties start (point)
-                          (list 'grease-id id
-                                'grease-name canonical-name
-                                'grease-type type
-                                'grease-source-id source-id
-                                'grease-is-duplicate is-duplicate
-                                'grease-full-path full-path))
+                           (list 'grease-id id
+                                 'grease-name canonical-name
+                                 'grease-type type
+                                 'grease-source-id source-id
+                                 'grease-is-duplicate is-duplicate
+                                 'grease-full-path full-path))
 
       ;; Add face to the name part only
-      (put-text-property name-start (point) 'face 'font-lock-function-name-face))
+      (put-text-property name-start (point) 'face 'font-lock-function-name-face)
 
-    (let ((eol (line-end-position)))
-      (insert "\n")
-
-      ;; Optionally display symlink target via a display-only overlay
-      ;; anchored on the last character of the filename.
-      (when (and grease-show-symlink-targets
-                 (file-symlink-p full-path))
-        (let* ((link-target (file-symlink-p full-path))
-               (resolved (expand-file-name link-target
-                                           (file-name-directory full-path)))
-               (target-face (if (file-exists-p resolved)
-                                'font-lock-comment-face
-                              'grease-symlink-broken))
-               (suffix (propertize (concat "  " resolved)
-                                   'face target-face)))
-          (let ((ov (make-overlay (1- eol) eol)))
-            (overlay-put ov 'after-string suffix)
-            (overlay-put ov 'grease-symlink-display t)))))))
+      (let ((name-end (line-end-position)))
+        (insert "\n")
+        (grease--make-symlink-display-overlay
+         name-start name-end id full-path)))))
 
 
 (defun grease--save-position ()
@@ -695,10 +681,9 @@ If target exceeds available files, go to last file line."
     (setq buffer-read-only nil)
     (setq grease--root-dir (file-name-as-directory (expand-file-name dir)))
     (grease--register-directory grease--root-dir)
+    ;; Remove only Grease-owned overlays while they still span buffer text.
+    (remove-overlays (point-min) (point-max) 'grease-symlink-display t)
     (erase-buffer)
-    ;; erase-buffer does not delete overlays; remove stale ones now
-    (dolist (ov (overlays-in (point-min) (point-max)))
-      (delete-overlay ov))
     (setq grease--original-state (make-hash-table :test 'equal))
     (setq grease--baseline-by-id (make-hash-table :test 'eql))
     (unless keep-changes
@@ -741,29 +726,67 @@ If target exceeds available files, go to last file line."
 
 ;;;; Symlink Overlay Lifecycle
 
+(defun grease--symlink-display-data (id full-path)
+  "Return display metadata for symlink ID at FULL-PATH.
+Prefer ID's committed registry path so an unsaved filename edit does not make
+its target display disappear."
+  (let* ((registry-entry (and id (grease--get-file-by-id id)))
+         (registry-path (and registry-entry
+                             (plist-get registry-entry :path)))
+         (registry-target (and registry-path
+                               (file-symlink-p registry-path)))
+         (source-path (if registry-target registry-path full-path))
+         (link-target (or registry-target (file-symlink-p full-path))))
+    (when link-target
+      (let ((resolved (expand-file-name
+                       link-target (file-name-directory source-path))))
+        (list :source-path source-path
+              :link-target link-target
+              :resolved resolved
+              :face (if (file-exists-p resolved)
+                        'font-lock-comment-face
+                      'grease-symlink-broken))))))
+
+(defun grease--make-symlink-display-overlay (name-start name-end id full-path)
+  "Display ID's symlink target after the filename from NAME-START to NAME-END.
+FULL-PATH is the entry's desired path.  The overlay spans the filename so a
+single backspace does not remove its display."
+  (when (and grease-show-symlink-targets (< name-start name-end))
+    (when-let ((data (grease--symlink-display-data id full-path)))
+      (let* ((suffix (propertize
+                      (concat "  " (plist-get data :resolved))
+                      'face (plist-get data :face)))
+             (overlay (make-overlay name-start name-end nil nil t)))
+        ;; Prevent Emacs from drawing point at the far end of virtual text.
+        (put-text-property 0 1 'cursor t suffix)
+        (overlay-put overlay 'after-string suffix)
+        (overlay-put overlay 'grease-symlink-display t)
+        (overlay-put overlay 'grease-id id)
+        (overlay-put overlay 'grease-symlink-source-path
+                     (plist-get data :source-path))
+        (overlay-put overlay 'grease-symlink-target
+                     (plist-get data :link-target))
+        (overlay-put overlay 'evaporate t)
+        overlay))))
+
+(defun grease--line-name-start (line-beg line-end)
+  "Return the start of the visible entry name between LINE-BEG and LINE-END."
+  (let ((position line-beg))
+    (while (and (< position line-end)
+                (or (get-text-property position 'grease-prefix)
+                    (get-text-property position 'grease-icon)))
+      (setq position (1+ position)))
+    position))
+
 (defun grease--refresh-symlink-overlay (line-beg line-end full-path)
-  "Refresh the symlink display overlay on the line between LINE-BEG and LINE-END.
-If FULL-PATH is a symlink and `grease-show-symlink-targets' is non-nil,
-create a display-only overlay anchored on the last character of the line.
-Otherwise, remove any existing symlink overlay."
-  ;; Remove any existing symlink overlay on this line
-  (dolist (ov (overlays-in line-beg line-end))
-    (when (overlay-get ov 'grease-symlink-display)
-      (delete-overlay ov)))
-  ;; Create new overlay if conditions are met
-  (when (and grease-show-symlink-targets
-             (file-symlink-p full-path))
-    (let* ((link-target (file-symlink-p full-path))
-           (resolved (expand-file-name link-target
-                                       (file-name-directory full-path)))
-           (target-face (if (file-exists-p resolved)
-                            'font-lock-comment-face
-                          'grease-symlink-broken))
-           (suffix (propertize (concat "  " resolved)
-                               'face target-face)))
-      (let ((ov (make-overlay (1- line-end) line-end)))
-        (overlay-put ov 'after-string suffix)
-        (overlay-put ov 'grease-symlink-display t)))))
+  "Refresh the symlink display between LINE-BEG and LINE-END for FULL-PATH."
+  (dolist (overlay (overlays-in line-beg line-end))
+    (when (overlay-get overlay 'grease-symlink-display)
+      (delete-overlay overlay)))
+  (let ((name-start (grease--line-name-start line-beg line-end))
+        (id (get-text-property line-beg 'grease-id)))
+    (grease--make-symlink-display-overlay
+     name-start line-end id full-path)))
 
 
 ;;;; Cursor Control and Evil Integration
@@ -970,10 +993,6 @@ Runs BEFORE Evil's delete (which will also yank)."
           (goto-char (region-beginning))
           (let ((end (save-excursion (goto-char (region-end)) (line-end-position))))
             (while (< (point) end)
-              ;; Remove symlink overlays before Evil deletes the line
-              (dolist (ov (overlays-in (line-beginning-position) (1+ (line-end-position))))
-                (when (overlay-get ov 'grease-symlink-display)
-                  (delete-overlay ov)))
               (let ((data (grease--get-line-data)))
                 (when data
                   (let* ((name (plist-get data :name))
@@ -1005,10 +1024,6 @@ Runs BEFORE Evil's delete (which will also yank)."
      ;; Single-line cut
      (t
       (let ((data (grease--get-line-data)))
-        ;; Remove symlink overlays on this line before Evil deletes it
-        (dolist (ov (overlays-in (line-beginning-position) (1+ (line-end-position))))
-          (when (overlay-get ov 'grease-symlink-display)
-            (delete-overlay ov)))
         (when data
           (let* ((name (plist-get data :name))
                  (type (plist-get data :type))
@@ -1227,25 +1242,29 @@ Runs BEFORE Evil's delete (which will also yank)."
   (when (derived-mode-p 'grease-mode)
     (save-excursion
       (goto-char (point-min))
-      (forward-line 1)
+      (forward-line 1) ; Skip header
       (while (not (eobp))
         (let* ((line-beg (line-beginning-position))
                (line-end (line-end-position))
                (line-data (grease--get-line-data (point))))
+
+          ;; Only process lines with our metadata
           (when line-data
-            (let* ((old-path (get-text-property line-beg 'grease-full-path))
-                   (visible-text (buffer-substring-no-properties line-beg line-end))
+            (let* ((visible-text (buffer-substring-no-properties
+                                  line-beg line-end))
                    (clean-text (grease--extract-filename visible-text))
                    (is-dir (grease--is-dir-name clean-text))
                    (name (grease--canonical-entry-name clean-text))
                    (type (if is-dir 'dir 'file))
                    (full-path (grease--get-full-path name)))
+
+              ;; Update text properties with new name
               (when (get-text-property line-beg 'grease-name)
                 (put-text-property line-beg line-end 'grease-name name)
                 (put-text-property line-beg line-end 'grease-type type)
                 (put-text-property line-beg line-end 'grease-full-path full-path)
-                ;; Refresh symlink display overlay
                 (grease--refresh-symlink-overlay line-beg line-end full-path)))))
+
         (forward-line 1)))))
 
 (defun grease--format-plain-lines ()
@@ -1373,33 +1392,28 @@ Runs BEFORE Evil's delete (which will also yank)."
     ;; Return the collected entries
     (nreverse entries)))
 
-(defun grease--on-change (_beg _end _len)
-  "Hook run after buffer changes to mark it dirty and refresh symlink overlays.
-Refreshing overlays here handles undo/redo: when the user undoes a `dd`,
-the deleted line's text comes back but overlays are not restored by undo.
-This function re-creates any missing symlink overlays on changed lines."
+(defun grease--on-change (beg end _len)
+  "Mark the buffer dirty and restore symlink overlays during undo.
+Ordinary edits do not query the filesystem; overlay refresh is limited to
+undo, which restores buffer text and properties but not overlays."
   (unless grease--change-hook-active
     (let ((grease--change-hook-active t))
       (setq grease--buffer-dirty-p t)
-      ;; Refresh symlink overlays for affected lines (e.g. after undo)
-      ;; Only run if the buffer is initialized (grease--root-dir set)
-      (when (and (derived-mode-p 'grease-mode) grease--root-dir)
+      (when (and (boundp 'undo-in-progress)
+                 undo-in-progress
+                 grease--root-dir)
         (save-excursion
-          ;; Determine the line range affected by the change
-          (let* ((beg-line (progn (goto-char _beg) (line-beginning-position)))
-                 (end-line (progn (goto-char (max _beg _end))
-                                  (forward-line 1)
-                                  (line-beginning-position))))
-            (goto-char beg-line)
-            (while (< (point) end-line)
-              (let* ((lb (line-beginning-position))
-                     (le (line-end-position))
+          (goto-char beg)
+          (let ((limit (copy-marker end)))
+            (while (< (point) limit)
+              (let* ((line-beg (line-beginning-position))
+                     (line-end (line-end-position))
                      (data (grease--get-line-data)))
-                (when data
-                  (let ((fp (plist-get data :full-path)))
-                    (when fp
-                      (grease--refresh-symlink-overlay lb le fp))))
-              (forward-line 1)))))))))
+                (when-let ((full-path (plist-get data :full-path)))
+                  (grease--refresh-symlink-overlay
+                   line-beg line-end full-path)))
+              (forward-line 1))
+            (set-marker limit nil)))))))
 
 ;;;; Change Calculation (Diff Engine)
 (defun grease--relative-path (path)

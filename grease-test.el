@@ -2627,23 +2627,13 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
 
 ;;;; Symlink Display Tests
 
-(defmacro grease-test-with-symlinks (dir symlinks &rest body)
-  "Execute BODY in DIR after creating SYMLINKS.
-SYMLINKS is a list of (LINK-NAME TARGET) pairs.
-LINK-NAME is relative to DIR; TARGET may be absolute or relative.
-Cleanup removes all created links."
-  (declare (indent 2))
-  `(let ((default-directory ,dir))
-     (dolist (link-spec ,symlinks)
-       (let ((link (expand-file-name (car link-spec) ,dir))
-             (target (cadr link-spec)))
-         (make-symbolic-link target link)))
-     (unwind-protect
-         (progn ,@body)
-       (dolist (link-spec ,symlinks)
-         (let ((link (expand-file-name (car link-spec) ,dir)))
-           (when (file-symlink-p link)
-             (delete-file link)))))))
+(defun grease-test--symlink-overlays ()
+  "Return every Grease symlink display overlay in the current buffer."
+  (let ((lists (overlay-lists)))
+    (cl-remove-if-not
+     (lambda (overlay)
+       (overlay-get overlay 'grease-symlink-display))
+     (append (car lists) (cdr lists)))))
 
 (ert-deftest grease-test-symlink-display-produces-no-operations ()
   "Displaying a buffer with symlink entries must not create diff operations."
@@ -2669,6 +2659,37 @@ Cleanup removes all created links."
                            (line-end-position))))
         (should (equal (grease--extract-filename visible-text) "mylink.txt"))
         (should-not (string-match-p "\\|target\\.txt" visible-text))))))
+
+(ert-deftest grease-test-symlink-cursor-stays-at-target-boundary ()
+  "Symlink virtual text must place the displayed cursor before its suffix."
+  (grease-test-with-temp-dir
+    (write-region "x" nil (expand-file-name "target.txt" temp-dir))
+    (make-symbolic-link "target.txt" (expand-file-name "mylink.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "mylink.txt")
+      (let* ((overlay (car (grease-test--symlink-overlays)))
+             (suffix (and overlay (overlay-get overlay 'after-string))))
+        (should overlay)
+        (should (= (- (overlay-end overlay) (overlay-start overlay))
+                   (length "mylink.txt")))
+        (should suffix)
+        (should (get-text-property 0 'cursor suffix))))))
+
+(ert-deftest grease-test-symlink-backspace-keeps-target-display ()
+  "Deleting one filename character must not delete the virtual target."
+  (grease-test-with-temp-dir
+    (write-region "x" nil (expand-file-name "target.txt" temp-dir))
+    (make-symbolic-link "target.txt" (expand-file-name "mylink.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "mylink.txt")
+      (let* ((overlay (car (grease-test--symlink-overlays)))
+             (suffix (copy-sequence (overlay-get overlay 'after-string)))
+             (inhibit-read-only t))
+        (goto-char (line-end-position))
+        (delete-char -1)
+        (should (overlay-buffer overlay))
+        (should (= (overlay-end overlay) (line-end-position)))
+        (should (equal (overlay-get overlay 'after-string) suffix))))))
 
 (ert-deftest grease-test-symlink-broken-display ()
   "A broken symlink should produce no diff operations and use the warning face."
@@ -2724,7 +2745,7 @@ Cleanup removes all created links."
           (overlays-in (line-beginning-position) (line-end-position))))))))
 
 (ert-deftest grease-test-symlink-rename-extract ()
-  "Renaming a symlink entry must produce a clean filename without suffix text."
+  "Renaming a symlink must parse cleanly and produce one relocation."
   (grease-test-with-temp-dir
     (write-region "x" nil (expand-file-name "target.txt" temp-dir))
     (make-symbolic-link "target.txt" (expand-file-name "old-link.txt" temp-dir))
@@ -2733,28 +2754,104 @@ Cleanup removes all created links."
       (let* ((line (buffer-substring-no-properties
                     (line-beginning-position)
                     (line-end-position)))
-             (parsed (grease--extract-filename line)))
-        (should (equal parsed "renamed-link.txt"))))))
+             (parsed (grease--extract-filename line))
+             (operations (grease--diff-by-id
+                          grease--baseline-by-id
+                          (grease--scan-buffer)))
+             (operation (car operations))
+             (overlay (car (grease-test--symlink-overlays)))
+             (suffix (and overlay (overlay-get overlay 'after-string))))
+        (should (equal parsed "renamed-link.txt"))
+        (should overlay)
+        (should (string-suffix-p
+                 (expand-file-name "target.txt" temp-dir) suffix))
+        (should (= (length operations) 1))
+        (should (eq (plist-get operation :kind) 'relocate))
+        (should (equal (plist-get operation :src)
+                       (expand-file-name "old-link.txt" temp-dir)))
+        (should (equal (plist-get operation :dst)
+                       (expand-file-name "renamed-link.txt" temp-dir)))))))
 
 (ert-deftest grease-test-symlink-delete-removes-overlay ()
-  "Deleting a symlink line must remove its overlay to prevent ghost displays."
+  "Deleting a symlink line must evaporate its display overlay."
   (grease-test-with-temp-dir
     (write-region "x" nil (expand-file-name "target.txt" temp-dir))
     (make-symbolic-link "target.txt" (expand-file-name "link.txt" temp-dir))
     (grease-test-with-buffer temp-dir
       (grease-test-goto-entry "link.txt")
+      (should (= (length (grease-test--symlink-overlays)) 1))
       (let ((inhibit-read-only t))
-        ;; Remove overlays as grease--before-evil-delete would
-        (dolist (ov (overlays-in (line-beginning-position) (1+ (line-end-position))))
-          (when (overlay-get ov 'grease-symlink-display)
-            (delete-overlay ov)))
-        ;; Delete the line
-        (delete-region (line-beginning-position) (1+ (line-end-position))))
-      ;; No symlink overlays should remain in the buffer
-      (let ((ghosts (cl-remove-if-not
-                     (lambda (o) (overlay-get o 'grease-symlink-display))
-                     (overlays-in (point-min) (point-max)))))
-        (should (zerop (length ghosts)))))))
+        (delete-region (line-beginning-position)
+                       (min (1+ (line-end-position)) (point-max))))
+      (should-not (grease-test--symlink-overlays)))))
+
+(ert-deftest grease-test-symlink-undo-restores-overlay ()
+  "Undoing a line deletion must restore its symlink display overlay."
+  (grease-test-with-temp-dir
+    (write-region "x" nil (expand-file-name "target.txt" temp-dir))
+    (make-symbolic-link "target.txt" (expand-file-name "link.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "link.txt")
+      (buffer-enable-undo)
+      (setq buffer-undo-list nil)
+      (undo-boundary)
+      (let ((inhibit-read-only t))
+        (delete-region (line-beginning-position)
+                       (min (1+ (line-end-position)) (point-max))))
+      (undo-boundary)
+      (should-not (grease-test--symlink-overlays))
+      (undo)
+      (should (grease-test-goto-entry "link.txt"))
+      (should (= (length (grease-test--symlink-overlays)) 1)))))
+
+(ert-deftest grease-test-symlink-rerender-has-no-ghost-overlays ()
+  "Rerendering must replace, rather than accumulate, symlink overlays."
+  (grease-test-with-temp-dir
+    (write-region "x" nil (expand-file-name "target.txt" temp-dir))
+    (make-symbolic-link "target.txt" (expand-file-name "link.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (should (= (length (grease-test--symlink-overlays)) 1))
+      (grease--render grease--root-dir t)
+      (should (= (length (grease-test--symlink-overlays)) 1)))))
+
+(ert-deftest grease-test-symlink-overlay-follows-appended-text ()
+  "Appending to a name must keep its display overlay at line end."
+  (grease-test-with-temp-dir
+    (write-region "x" nil (expand-file-name "target.txt" temp-dir))
+    (make-symbolic-link "target.txt" (expand-file-name "link.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "link.txt")
+      (let ((inhibit-read-only t)
+            (overlay (car (grease-test--symlink-overlays))))
+        (goto-char (line-end-position))
+        (insert "-renamed")
+        (should (= (overlay-end overlay) (line-end-position)))))))
+
+(ert-deftest grease-test-symlink-relative-and-absolute-target-display ()
+  "Relative and absolute targets must display as resolved absolute paths."
+  (grease-test-with-temp-dir
+    (let* ((relative-target "relative-target.txt")
+           (absolute-target (expand-file-name "absolute-target.txt" temp-dir))
+           (expected-relative (expand-file-name relative-target temp-dir)))
+      (write-region "relative" nil expected-relative)
+      (write-region "absolute" nil absolute-target)
+      (make-symbolic-link relative-target
+                          (expand-file-name "relative-link" temp-dir))
+      (make-symbolic-link absolute-target
+                          (expand-file-name "absolute-link" temp-dir))
+      (grease-test-with-buffer temp-dir
+        (dolist (spec `(("relative-link" . ,expected-relative)
+                        ("absolute-link" . ,absolute-target)))
+          (grease-test-goto-entry (car spec))
+          (let* ((overlay
+                  (cl-find-if
+                   (lambda (candidate)
+                     (overlay-get candidate 'grease-symlink-display))
+                   (overlays-in (line-beginning-position)
+                                (line-end-position))))
+                 (suffix (and overlay (overlay-get overlay 'after-string))))
+            (should suffix)
+            (should (string-suffix-p (cdr spec) suffix))))))))
 
 (provide 'grease-test)
 ;;; grease-test.el ends here
