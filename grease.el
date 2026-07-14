@@ -52,6 +52,29 @@ If non-nil, the window existed before grease and should be restored on close.")
   "When non-nil, preview buffer for files is writable.
 Does not apply to directories.")
 
+;;; Faces — entry display
+
+(defface grease-file-face
+  '((t :inherit font-lock-variable-name-face))
+  "Face for regular file entries in the grease buffer.
+Inherits from `font-lock-variable-name-face' by default so the
+colour responds to the active theme without hardcoding hex values."
+  :group 'grease)
+
+(defface grease-directory-face
+  '((t :inherit font-lock-function-name-face))
+  "Face for directory entries in the grease buffer.
+Inherits from `font-lock-function-name-face' by default to make
+directories visually distinct from files in most themes."
+  :group 'grease)
+
+(defface grease-hidden-face
+  '((t :inherit shadow))
+  "Face for hidden-file and hidden-directory entries (dotfiles).
+Inherits from the built-in `shadow' face so hidden entries
+appear greyed out by default."
+  :group 'grease)
+
 ;;; Symlink display toggle & faces
 
 (defcustom grease-show-symlink-targets t
@@ -66,6 +89,38 @@ the resolved target."
   "Face for the resolved target of a broken symlink.
 Used when the symlink target does not exist on the filesystem."
   :group 'grease)
+
+(defcustom grease-file-face-foreground nil
+  "Custom foreground colour for regular file entries.
+When nil (the default), the face inherits from the active theme
+via `font-lock-variable-name-face'.  Set to a colour string such as
+\"#abcdef\" to override file entry colours everywhere."
+  :type '(choice (const :tag "Inherit from theme" nil) color)
+  :group 'grease)
+
+(defcustom grease-directory-face-foreground nil
+  "Custom foreground colour for directory entries.
+When nil (the default), the face inherits from the active theme
+via `font-lock-function-name-face'.  Set to a colour string such as
+\"#ff8800\" to override directory entry colours everywhere."
+  :type '(choice (const :tag "Inherit from theme" nil) color)
+  :group 'grease)
+
+(defcustom grease-hidden-face-foreground nil
+  "Custom foreground colour for hidden (dotfile) entries.
+When nil (the default), the face inherits from the built-in `shadow'
+face, which is typically grey.  Set to a colour string such as
+\"#888888\" to override hidden-entry colours everywhere."
+  :type '(choice (const :tag "Inherit from theme" nil) color)
+  :group 'grease)
+
+(defun grease--apply-custom-face-colors ()
+  "Push `grease-*-face-foreground' overrides onto the grease faces."
+  (dolist (spec `((grease-file-face . ,grease-file-face-foreground)
+                  (grease-directory-face . ,grease-directory-face-foreground)
+                  (grease-hidden-face . ,grease-hidden-face-foreground)))
+    (when (cdr spec)
+      (set-face-attribute (car spec) nil :foreground (cdr spec)))))
 
 (defcustom grease-skip-confirm-for-simple-edits nil
   "When non-nil, save simple edits without asking for confirmation.
@@ -680,8 +735,15 @@ ENTRY-KIND is `file', `dir', or `symlink'; LINK-TARGET is raw link text."
                                  'grease-is-duplicate is-duplicate
                                  'grease-full-path full-path))
 
-      ;; Add face to the name part only
-      (put-text-property name-start (point) 'face 'font-lock-function-name-face)
+      ;; Add face to the name part only, chosen by entry kind
+      (put-text-property name-start (point) 'face
+                         (cond
+                          ((grease--hidden-file-p canonical-name)
+                           'grease-hidden-face)
+                          ((eq type 'dir)
+                           'grease-directory-face)
+                          (t
+                           'grease-file-face)))
 
       (let ((name-end (line-end-position)))
         (insert "\n")
@@ -3108,7 +3170,9 @@ editing or discard all staged Grease-buffer changes."
   (setq buffer-read-only nil) ;; Ensure buffer is not read-only
   (add-hook 'after-change-functions #'grease--on-change nil t)
   (add-hook 'kill-buffer-hook #'grease--close-preview nil t)
-  (grease--setup-cursor-constraints))
+  (grease--setup-cursor-constraints)
+  ;; Apply any user-configured face colour overrides.
+  (grease--apply-custom-face-colors))
 
 ;; Set up Evil keybindings
 (when (fboundp 'evil-define-key*)
@@ -3417,6 +3481,9 @@ If already open, quit (saving position). Otherwise open project root."
     (maphash (lambda (id data)
                (princ (format "  %s: %S\n" id data)))
              grease--file-registry)))
+
+;; Apply any user-configured face colour overrides on initial load.
+(grease--apply-custom-face-colors)
 
 (provide 'grease)
 ;;; grease.el ends here
