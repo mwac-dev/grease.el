@@ -2827,6 +2827,79 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
         (insert "-renamed")
         (should (= (overlay-end overlay) (line-end-position)))))))
 
+(ert-deftest grease-test-symlink-open-line-below-keeps-overlay-in-place ()
+  "Opening a line below a symlink must not move its virtual target."
+  (grease-test-with-temp-dir
+    (write-region "x" nil (expand-file-name "target.txt" temp-dir))
+    (make-symbolic-link "target.txt" (expand-file-name "link.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "link.txt")
+      (let* ((overlay (car (grease-test--symlink-overlays)))
+             (symlink-line (line-number-at-pos))
+             (suffix (overlay-get overlay 'after-string))
+             (inhibit-read-only t))
+        (goto-char (line-end-position))
+        (newline)
+        (should (= (line-number-at-pos) (1+ symlink-line)))
+        (should (= (save-excursion
+                     (goto-char (overlay-start overlay))
+                     (line-number-at-pos))
+                   symlink-line))
+        (should (= (overlay-end overlay)
+                   (save-excursion
+                     (goto-char (overlay-start overlay))
+                     (line-end-position))))
+        (should (equal (overlay-get overlay 'after-string) suffix))
+        (should (= (length (grease-test--symlink-overlays)) 1))))))
+
+(ert-deftest grease-test-symlink-open-line-above-keeps-overlay-with-entry ()
+  "Opening a line above a symlink must keep its target on the entry line."
+  (grease-test-with-temp-dir
+    (write-region "x" nil (expand-file-name "target.txt" temp-dir))
+    (make-symbolic-link "target.txt" (expand-file-name "link.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "link.txt")
+      (let ((overlay (car (grease-test--symlink-overlays)))
+            (inhibit-read-only t))
+        (goto-char (line-beginning-position))
+        (newline)
+        (should (= (overlay-end overlay) (line-end-position)))
+        (should (= (save-excursion
+                     (goto-char (overlay-start overlay))
+                     (line-number-at-pos))
+                   (line-number-at-pos)))
+        (forward-line -1)
+        (should-not
+         (cl-find-if
+          (lambda (candidate)
+            (and (overlay-get candidate 'grease-symlink-display)
+                 (<= (line-beginning-position) (overlay-start candidate))
+                 (<= (overlay-start candidate) (line-end-position))))
+          (grease-test--symlink-overlays)))))))
+
+(ert-deftest grease-test-symlink-open-line-creates-only-ordinary-entry ()
+  "Typing below a symlink must create one entry without target-text leakage."
+  (grease-test-with-temp-dir
+    (write-region "x" nil (expand-file-name "target.txt" temp-dir))
+    (make-symbolic-link "target.txt" (expand-file-name "link.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "link.txt")
+      (let ((inhibit-read-only t))
+        (goto-char (line-end-position))
+        (newline)
+        (insert "created.txt"))
+      (let* ((operations (grease--diff-by-id
+                          grease--baseline-by-id
+                          (grease--scan-buffer)))
+             (creates (cl-remove-if-not
+                       (lambda (operation)
+                         (eq (plist-get operation :kind) 'create))
+                       operations)))
+        (should (= (length creates) 1))
+        (should (equal (plist-get (car creates) :dst)
+                       (expand-file-name "created.txt" temp-dir)))
+        (should (= (length (grease-test--symlink-overlays)) 1))))))
+
 (ert-deftest grease-test-symlink-relative-and-absolute-target-display ()
   "Relative and absolute targets must display as resolved absolute paths."
   (grease-test-with-temp-dir

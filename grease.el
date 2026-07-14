@@ -756,7 +756,7 @@ single backspace does not remove its display."
       (let* ((suffix (propertize
                       (concat "  " (plist-get data :resolved))
                       'face (plist-get data :face)))
-             (overlay (make-overlay name-start name-end nil nil t)))
+             (overlay (make-overlay name-start name-end)))
         ;; Prevent Emacs from drawing point at the far end of virtual text.
         (put-text-property 0 1 'cursor t suffix)
         (overlay-put overlay 'after-string suffix)
@@ -777,6 +777,35 @@ single backspace does not remove its display."
                     (get-text-property position 'grease-icon)))
       (setq position (1+ position)))
     position))
+
+(defun grease--symlink-display-overlays ()
+  "Return every live symlink display overlay in the current buffer."
+  (let ((overlay-lists (overlay-lists)))
+    (cl-remove-if-not
+     (lambda (overlay)
+       (overlay-get overlay 'grease-symlink-display))
+     (append (car overlay-lists) (cdr overlay-lists)))))
+
+(defun grease--reposition-symlink-overlays (beg end)
+  "Keep symlink overlays on their entry lines after a change from BEG to END.
+This only moves existing overlays and never queries the filesystem."
+  (let (changed-line-beg changed-line-end)
+    (save-excursion
+      (goto-char (min beg (point-max)))
+      (setq changed-line-beg (line-beginning-position))
+      (goto-char (min end (point-max)))
+      (setq changed-line-end (line-end-position)))
+    (dolist (overlay (grease--symlink-display-overlays))
+      (when-let ((anchor (overlay-start overlay)))
+        (save-excursion
+          (goto-char anchor)
+          (let ((overlay-line-beg (line-beginning-position))
+                (overlay-line-end (line-end-position)))
+            (when (and (<= overlay-line-beg changed-line-end)
+                       (>= overlay-line-end changed-line-beg))
+              ;; A non-rear-advancing overlay cannot absorb an inserted newline.
+              ;; Move its end explicitly so appended filename text stays covered.
+              (move-overlay overlay anchor overlay-line-end))))))))
 
 (defun grease--refresh-symlink-overlay (line-beg line-end full-path)
   "Refresh the symlink display between LINE-BEG and LINE-END for FULL-PATH."
@@ -1399,6 +1428,7 @@ undo, which restores buffer text and properties but not overlays."
   (unless grease--change-hook-active
     (let ((grease--change-hook-active t))
       (setq grease--buffer-dirty-p t)
+      (grease--reposition-symlink-overlays beg end)
       (when (and (boundp 'undo-in-progress)
                  undo-in-progress
                  grease--root-dir)
