@@ -1847,12 +1847,13 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
 
 (ert-deftest grease-test-get-full-path ()
   "Test full path construction."
-  (grease-test-with-clean-state
-    (let ((grease--root-dir "/home/user/project/"))
-      (should (equal (grease--get-full-path "file.txt")
-                     "/home/user/project/file.txt"))
-      (should (equal (grease--get-full-path "subdir/")
-                     "/home/user/project/subdir")))))
+  (grease-test-with-temp-dir
+    (grease-test-with-clean-state
+      (let ((grease--root-dir (file-name-as-directory temp-dir)))
+        (should (equal (grease--get-full-path "file.txt")
+                       (concat (file-name-as-directory temp-dir) "file.txt")))
+        (should (equal (grease--get-full-path "subdir/")
+                       (concat (file-name-as-directory temp-dir) "subdir")))))))
 
 ;;;; Format Change Tests
 
@@ -1915,7 +1916,8 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
       (goto-char (point-max))
       (let ((inhibit-read-only t))
         (insert "test/\n"))
-      (let (captured-prompt)
+      (let ((grease-skip-confirm-for-simple-edits nil)
+            captured-prompt)
         (cl-letf (((symbol-function 'read-char-choice)
                    (lambda (prompt &rest _)
                      (setq captured-prompt prompt)
@@ -1963,19 +1965,20 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
 
 (ert-deftest grease-test-insert-directory-adds-one-display-slash ()
   "Directory rendering should add exactly one display-only trailing slash."
-  (grease-test-with-clean-state
-    (with-temp-buffer
-      (grease-mode)
-      (setq grease--root-dir "/tmp/")
-      (grease--insert-entry 42 "test///" 'dir)
-      (should (string-match-p "test/" (buffer-string)))
-      (should-not (string-match-p "test//" (buffer-string)))
-      (goto-char (point-min))
-      ;; The synthetic test buffer has no header, so inspect properties
-      ;; directly rather than the header-aware line-data helper.
-      (should (equal (get-text-property (point) 'grease-name) "test"))
-      (should (equal (get-text-property (point) 'grease-full-path)
-                     "/tmp/test")))))
+  (grease-test-with-temp-dir
+    (grease-test-with-clean-state
+      (with-temp-buffer
+        (grease-mode)
+        (setq grease--root-dir (file-name-as-directory temp-dir))
+        (grease--insert-entry 42 "test///" 'dir)
+        (should (string-match-p "test/" (buffer-string)))
+        (should-not (string-match-p "test//" (buffer-string)))
+        (goto-char (point-min))
+        ;; The synthetic test buffer has no header, so inspect properties
+        ;; directly rather than the header-aware line-data helper.
+        (should (equal (get-text-property (point) 'grease-name) "test"))
+        (should (equal (get-text-property (point) 'grease-full-path)
+                       (concat (file-name-as-directory temp-dir) "test")))))))
 
 (ert-deftest grease-test-directory-type-and-id-survive-rescan ()
   "Canonicalizing directory metadata should not change its type or identity."

@@ -2377,10 +2377,13 @@ possibly rebased raw target to create at DST."
                     (not (equal (plist-get operation :link-target)
                                 destination-target)))))
          (if (and (grease--same-filesystem-adapter-p src dst)
-                  (not rebase-symlink-p))
+                  (not rebase-symlink-p)
+                  (not (eq entry-kind 'symlink)))
              (rename-file src dst nil)
-           ;; Rebased and cross-adapter relocations create the destination
-           ;; first.  The source remains recoverable if creation fails.
+           ;; Symlinks and cross-adapter/rebased relocations create the
+           ;; destination first; rename-file is unreliable for symlinks
+           ;; on some platforms.  The source remains recoverable if
+           ;; creation fails.
            (grease--copy-path-without-overwrite
             src dst entry-kind
             (plist-get operation :link-target)
