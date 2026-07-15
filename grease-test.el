@@ -1851,9 +1851,9 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
     (grease-test-with-clean-state
       (let ((grease--root-dir (file-name-as-directory temp-dir)))
         (should (equal (grease--get-full-path "file.txt")
-                       (expand-file-name "file.txt" temp-dir)))
+                       (concat (file-name-as-directory temp-dir) "file.txt")))
         (should (equal (grease--get-full-path "subdir/")
-                       (expand-file-name "subdir" temp-dir)))))))
+                       (concat (file-name-as-directory temp-dir) "subdir")))))))
 
 ;;;; Format Change Tests
 
@@ -1978,7 +1978,7 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
         ;; directly rather than the header-aware line-data helper.
         (should (equal (get-text-property (point) 'grease-name) "test"))
         (should (equal (get-text-property (point) 'grease-full-path)
-                       (expand-file-name "test" temp-dir)))))))
+                       (concat (file-name-as-directory temp-dir) "test")))))))
 
 (ert-deftest grease-test-directory-type-and-id-survive-rescan ()
   "Canonicalizing directory metadata should not change its type or identity."
