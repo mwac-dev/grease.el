@@ -89,6 +89,11 @@ A more complete configuration showing all available options:
   ;; When set to t, saves simple edits without asking first.
   ;; Simple edits: no deletes, up to 5 creates, up to 1 copy,
   ;; and up to 1 move/rename on the same local/remote filesystem.
+
+  ;; Entry face colour overrides (set to nil to inherit from theme)
+  (setq grease-file-face-foreground nil)      ; e.g. "#abcdef"
+  (setq grease-directory-face-foreground nil) ; e.g. "#ff8800"
+  (setq grease-hidden-face-foreground nil)    ; e.g. "#888888"
   )
 #+end_src
 
@@ -183,6 +188,9 @@ Grease buffers as one transaction. This applies equally to ~C-c C-s~,
 - Confirmation describes the combined transaction. Choosing cancel changes
   nothing; choosing discard discards the changes in every participating
   Grease buffer.
+- When a transaction conflict is detected (e.g. two buffers staging
+  conflicting destinations for the same file), Grease prompts to keep
+  editing or discard all staged Grease-buffer changes.
 - Cyclic renames are supported, including file swaps, directory swaps with
   nested contents, and larger rotations.
 - Grease validates destinations before execution and refuses to overwrite an
@@ -371,18 +379,21 @@ Here's an example Doom-style setup:
        :desc "Quit Grease"               "q" #'grease-quit)) ;;I just always use toggle
 #+end_src
 
-
 * Configuration Variables
 
-| Variable                      | Default | Description                              |
-|-------------------------------+---------+------------------------------------------|
-| ~grease-use-icons~              | ~t~       | Show icons (requires nerd-icons)         |
-| ~grease-sort-method~            | ~'type~   | Default sorting method                   |
-| ~grease-sort-directories-first~ | ~t~       | Show directories before files            |
-| ~grease-show-hidden~            | ~nil~     | Show hidden files by default             |
-| ~grease-show-symlink-targets~   | ~t~       | Show display-only symlink targets        |
-| ~grease-preview-window-width~   | ~0.4~     | Preview window width (fraction of frame) |
-| ~grease-preview-writable~       | ~nil~     | Make file previews editable              |
+| Variable                             | Default | Description                                  |
+|--------------------------------------+---------+----------------------------------------------|
+| ~grease-use-icons~                     | ~t~       | Show icons (requires nerd-icons)             |
+| ~grease-sort-method~                   | ~'type~   | Default sorting method                       |
+| ~grease-sort-directories-first~        | ~t~       | Show directories before files                |
+| ~grease-show-hidden~                   | ~nil~     | Show hidden files by default                 |
+| ~grease-show-symlink-targets~          | ~t~       | Show display-only symlink targets            |
+| ~grease-preview-window-width~          | ~0.4~     | Preview window width (fraction of frame)     |
+| ~grease-preview-writable~              | ~nil~     | Make file previews editable                  |
+| ~grease-skip-confirm-for-simple-edits~ | ~nil~     | Skip confirmation for simple edits           |
+| ~grease-file-face-foreground~          | ~nil~     | Override colour for file entries             |
+| ~grease-directory-face-foreground~     | ~nil~     | Override colour for directory entries        |
+| ~grease-hidden-face-foreground~        | ~nil~     | Override colour for hidden (dotfile) entries |
 
 * Feature Checklist
 
@@ -412,6 +423,9 @@ Here's an example Doom-style setup:
   Example: ~dir1/file.org~ creates ~dir1/~ and then ~file.org~ inside.
 - [X] Nested directory creation before commit
   Example: ~dir1/dir2/dir3/~ creates the full path.
+- [X] Customizable entry faces (file, directory, hidden/dotfile) with theme inheritance.
+- [X] Colour overrides for entry faces via simple hex-string defcustoms.
+- [X] Transaction conflict detection with keep-or-discard prompt.
 
 ** Not Yet Implemented
 - [ ] Tighter integration with dired/dirvish (future possibility).
