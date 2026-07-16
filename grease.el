@@ -122,6 +122,17 @@ face, which is typically grey.  Set to a colour string such as
     (when (cdr spec)
       (set-face-attribute (car spec) nil :foreground (cdr spec)))))
 
+(defcustom grease-line-format "wrap"
+  "How to display lines in Grease buffers.
+\"truncate\" — long lines are cut off at the window edge.
+\"wrap\" — long lines wrap onto the next line."
+  :type '(choice (const "truncate") (const "wrap"))
+  :group 'grease)
+
+(defun grease--apply-line-format ()
+  "Apply `grease-line-format' to the current buffer."
+  (setq-local truncate-lines (equal grease-line-format "truncate")))
+
 (defcustom grease-skip-confirm-for-simple-edits nil
   "When non-nil, save simple edits without asking for confirmation.
 A simple edit has no deletes, at most five creates, at most one copy,
@@ -1020,7 +1031,7 @@ This only moves existing overlays and never queries the filesystem."
   (when (derived-mode-p 'grease-mode)
     (cond
      ;; Multi-line selection in visual mode
-     ((and (boundp 'evil-state) 
+     ((and (boundp 'evil-state)
            (eq evil-state 'visual)
            (memq (evil-visual-type) '(line block)))
       (let* ((beg (line-number-at-pos (region-beginning)))
@@ -1033,7 +1044,7 @@ This only moves existing overlays and never queries the filesystem."
              (entry-kinds '())
              (link-targets '())
              (paths '()))
-        
+
         ;; Collect all selected files
         (save-excursion
           (goto-char (region-beginning))
@@ -1049,7 +1060,7 @@ This only moves existing overlays and never queries the filesystem."
                 (push (plist-get data :link-target) link-targets)
                 (push (grease--get-full-path (plist-get data :name)) paths)))
             (forward-line 1)))
-        
+
         ;; Store the multi-line selection data if we found files
         (when names
           (setq grease--multi-line-selection
@@ -1063,7 +1074,7 @@ This only moves existing overlays and never queries the filesystem."
                       :original-dir grease--root-dir))
           (setq grease--last-op-type 'file)
           (setq grease--last-kill-index 0))))
-     
+
      ;; Single line operation (yy/dd)
      ((let ((data (grease--get-line-data)))
         (when (and data (bolp))
@@ -1073,7 +1084,7 @@ This only moves existing overlays and never queries the filesystem."
           ;; Clear multi-selection data
           (setq grease--multi-line-selection nil)
           t)))
-     
+
      ;; Regular text operation
      (t
       (setq grease--last-op-type 'text)
@@ -1366,7 +1377,7 @@ Runs BEFORE Evil's delete (which will also yank)."
 (when (fboundp 'evil-yank)
   (advice-add 'evil-yank :after #'grease--on-evil-yank))
 
-;; Advice for delete operations  
+;; Advice for delete operations
 (when (fboundp 'evil-delete-line)
   (advice-add 'evil-delete-line :before #'grease--before-evil-delete))
 
@@ -1383,7 +1394,7 @@ Runs BEFORE Evil's delete (which will also yank)."
 ;; For regular Emacs operations that change the kill ring
 (advice-add 'kill-new :after
             (lambda (&rest _)
-              (unless (and (derived-mode-p 'grease-mode) 
+              (unless (and (derived-mode-p 'grease-mode)
                            (eq grease--last-op-type 'file))
                 (setq grease--last-op-type 'text)
                 (setq grease--last-kill-index nil))))
@@ -1423,7 +1434,7 @@ Runs BEFORE Evil's delete (which will also yank)."
               (lambda (&rest _)
                 ;; Update our index when user rotates through the kill ring
                 (when grease--last-kill-index
-                  (setq grease--last-kill-index 
+                  (setq grease--last-kill-index
                         (mod (1+ grease--last-kill-index) (length kill-ring)))))))
 
 ;; Evil ex-command for save
@@ -2946,11 +2957,11 @@ editing or discard all staged Grease-buffer changes."
                     :source-kinds (list (grease--line-data-source-kind data))
                     :original-dir grease--root-dir
                     :operation 'copy))
-        
+
         ;; Mark this as a file operation
         (setq grease--last-op-type 'file)
         (setq grease--last-kill-index 0)
-        
+
         (message "Copied file: %s" name)))))
 
 (defun grease-paste ()
@@ -3169,13 +3180,13 @@ editing or discard all staged Grease-buffer changes."
   ;; Grease buffers are editable directory listings, not source files.  Avoid
   ;; `prog-mode' hooks such as tree-sitter/font-lock change tracking, which can
   ;; assert when Evil opens and edits synthetic listing lines.
-  (setq-local truncate-lines t)
   (setq buffer-read-only nil) ;; Ensure buffer is not read-only
   (add-hook 'after-change-functions #'grease--on-change nil t)
   (add-hook 'kill-buffer-hook #'grease--close-preview nil t)
   (grease--setup-cursor-constraints)
   ;; Apply any user-configured face colour overrides.
   (grease--apply-custom-face-colors))
+  (grease--apply-line-format)
 
 ;; Set up Evil keybindings
 (when (fboundp 'evil-define-key*)
