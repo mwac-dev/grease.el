@@ -3127,6 +3127,35 @@ editing or discard all staged Grease-buffer changes."
       (grease--render grease--root-dir)
       (message "Grease: Refreshed."))))
 
+(defun grease-xdg-open ()
+  "Open the file at point with the system default application.
+Uses `xdg-open' asynchronously; the Grease buffer stays open.
+Only acts on files: directories and other non-file objects are
+ignored with a message.  Unsaved renames open the file's committed
+on-disk path; entries that have never been saved signal an error."
+  (interactive)
+  (let ((data (grease--get-line-data)))
+    (cond
+     ((null data)
+      (user-error "Not on a file line"))
+     ((eq (plist-get data :type) 'dir)
+      (message "grease-xdg-open: %s is not a file; xdg-open only works on files"
+               (plist-get data :name)))
+     ((not (grease--line-data-real-file-p data))
+      (user-error "File not saved to disk yet: %s" (plist-get data :name)))
+     (t
+      (let* ((registry-entry (grease--get-file-by-id (plist-get data :id)))
+             (path (or (plist-get registry-entry :path)
+                       (grease--get-full-path (plist-get data :name)))))
+        (when (file-remote-p path)
+          (user-error "Cannot xdg-open a remote file: %s" path))
+        (unless (file-exists-p path)
+          (user-error "File does not exist on disk: %s" path))
+        (unless (executable-find "xdg-open")
+          (user-error "Program xdg-open not found in PATH"))
+        (start-process "grease-xdg-open" nil "xdg-open" path)
+        (message "Opened: %s" (file-name-nondirectory path)))))))
+
 (defun grease-quit ()
   "Quit this Grease buffer only after the unified save succeeds."
   (interactive)
@@ -3192,6 +3221,7 @@ editing or discard all staged Grease-buffer changes."
 (when (fboundp 'evil-define-key*)
   (evil-define-key* 'normal grease-mode-map
     (kbd "RET") #'grease-visit
+    (kbd "<S-return>") #'grease-xdg-open
     (kbd "-") #'grease-up-directory
     (kbd "g r") #'grease-refresh
     (kbd "g p") #'grease-toggle-preview

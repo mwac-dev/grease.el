@@ -3390,5 +3390,72 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
             (should suffix)
             (should (string-suffix-p (cdr spec) suffix))))))))
 
+
+;;;; grease-xdg-open Tests
+
+(ert-deftest grease-test-xdg-open-file-calls-xdg-open ()
+  "Opening a file at point spawns xdg-open with the file's absolute path."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "file.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "file.txt")
+      (let (calls)
+        (cl-letf (((symbol-function 'start-process)
+                   (lambda (&rest args) (push args calls) nil))
+                  ((symbol-function 'executable-find)
+                   (lambda (_) "/usr/bin/xdg-open")))
+          (grease-xdg-open))
+        (should (= (length calls) 1))
+        (should (equal (car calls)
+                       (list "grease-xdg-open" nil "xdg-open"
+                             (expand-file-name "file.txt" temp-dir))))))))
+
+(ert-deftest grease-test-xdg-open-directory-is-ignored ()
+  "Directories are ignored with a message and no process spawn."
+  (grease-test-with-temp-dir
+    (make-directory (expand-file-name "subdir" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "subdir")
+      (let (calls)
+        (cl-letf (((symbol-function 'start-process)
+                   (lambda (&rest args) (push args calls) nil)))
+          (grease-xdg-open))
+        (should (null calls))))))
+
+(ert-deftest grease-test-xdg-open-not-on-entry ()
+  "Point on the header line signals `user-error'."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-min))
+      (should-error (grease-xdg-open) :type 'user-error))))
+
+(ert-deftest grease-test-xdg-open-pending-entry-errors ()
+  "An entry that was never saved to disk signals `user-error'."
+  (grease-test-with-temp-dir
+    (grease-test-with-buffer temp-dir
+      (goto-char (point-max))
+      (insert "brand-new.txt")
+      (goto-char (line-beginning-position))
+      (let (calls)
+        (cl-letf (((symbol-function 'start-process)
+                   (lambda (&rest args) (push args calls) nil)))
+          (should-error (grease-xdg-open) :type 'user-error))
+        (should (null calls))))))
+
+(ert-deftest grease-test-xdg-open-keeps-buffer-open ()
+  "Opening a file leaves the Grease buffer alive and clean."
+  (grease-test-with-temp-dir
+    (write-region "" nil (expand-file-name "file.txt" temp-dir))
+    (grease-test-with-buffer temp-dir
+      (grease-test-goto-entry "file.txt")
+      (cl-letf (((symbol-function 'start-process)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'executable-find)
+                 (lambda (_) "/usr/bin/xdg-open")))
+        (grease-xdg-open))
+      (should (buffer-live-p (current-buffer)))
+      (should (derived-mode-p 'grease-mode))
+      (should-not grease--buffer-dirty-p))))
+
 (provide 'grease-test)
 ;;; grease-test.el ends here
