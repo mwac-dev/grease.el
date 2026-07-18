@@ -3457,5 +3457,107 @@ Each entry is a plist with `:path' and `:type'.  Directory entries use type
       (should (derived-mode-p 'grease-mode))
       (should-not grease--buffer-dirty-p))))
 
+
+;;;; Plugin Loading Tests
+
+(defvar grease-test--plugin-log nil
+  "Names pushed by plugin fixtures during plugin-loading tests.")
+
+(defun grease-test--write-plugin (dir name &rest forms)
+  "Write plugin NAME into DIR containing FORMS."
+  (with-temp-file (expand-file-name name dir)
+    (dolist (form forms)
+      (prin1 form (current-buffer))
+      (insert "\n"))))
+
+(ert-deftest grease-test-plugins-load-all-alphabetically ()
+  "All top-level plugins load, in alphabetical filename order."
+  (grease-test-with-temp-dir
+    (grease-test--write-plugin temp-dir "b-second.el"
+                               '(push "b-second" grease-test--plugin-log))
+    (grease-test--write-plugin temp-dir "a-first.el"
+                               '(push "a-first" grease-test--plugin-log))
+    (grease-test--write-plugin temp-dir "c-third.el"
+                               '(push "c-third" grease-test--plugin-log))
+    (let ((grease-plugins-directory temp-dir)
+          (grease--plugins-loaded nil)
+          (grease-test--plugin-log nil))
+      (grease--apply-plugin-config)
+      (should (equal (reverse grease-test--plugin-log)
+                     '("a-first" "b-second" "c-third"))))))
+
+(ert-deftest grease-test-plugins-ignore-non-plugins ()
+  "Non-el files, dotfiles, lockfiles, and subdirectories are ignored."
+  (grease-test-with-temp-dir
+    (grease-test--write-plugin temp-dir "real.el"
+                               '(push "real" grease-test--plugin-log))
+    (write-region "not lisp" nil (expand-file-name "notes.txt" temp-dir))
+    (grease-test--write-plugin temp-dir ".hidden.el"
+                               '(push "hidden" grease-test--plugin-log))
+    (grease-test--write-plugin temp-dir ".#lock.el"
+                               '(push "lock" grease-test--plugin-log))
+    (make-directory (expand-file-name "sub" temp-dir))
+    (grease-test--write-plugin (expand-file-name "sub" temp-dir) "inner.el"
+                               '(push "inner" grease-test--plugin-log))
+    (let ((grease-plugins-directory temp-dir)
+          (grease--plugins-loaded nil)
+          (grease-test--plugin-log nil))
+      (grease--apply-plugin-config)
+      (should (equal grease-test--plugin-log '("real"))))))
+
+(ert-deftest grease-test-plugins-isolate-errors ()
+  "A failing plugin warns and does not stop later plugins."
+  (grease-test-with-temp-dir
+    (grease-test--write-plugin temp-dir "a-broken.el" '(error "boom"))
+    (grease-test--write-plugin temp-dir "b-good.el"
+                               '(push "b-good" grease-test--plugin-log))
+    (let ((grease-plugins-directory temp-dir)
+          (grease--plugins-loaded nil)
+          (grease-test--plugin-log nil)
+          warnings)
+      (cl-letf (((symbol-function 'display-warning)
+                 (lambda (_type message &rest _) (push message warnings))))
+        (grease--apply-plugin-config))
+      (should (equal grease-test--plugin-log '("b-good")))
+      (should (= (length warnings) 1))
+      (should (string-match-p "a-broken\\.el" (car warnings))))))
+
+(ert-deftest grease-test-plugins-load-once-unless-forced ()
+  "Plugins load once per session; FORCE bypasses the guard."
+  (grease-test-with-temp-dir
+    (grease-test--write-plugin temp-dir "p.el"
+                               '(push "p" grease-test--plugin-log))
+    (let ((grease-plugins-directory temp-dir)
+          (grease--plugins-loaded nil)
+          (grease-test--plugin-log nil))
+      (grease--apply-plugin-config)
+      (grease--apply-plugin-config)
+      (should (equal grease-test--plugin-log '("p")))
+      (grease--apply-plugin-config t)
+      (should (equal grease-test--plugin-log '("p" "p"))))))
+
+(ert-deftest grease-test-plugins-missing-directory-is-silent ()
+  "A missing plugins directory is a silent no-op."
+  (let ((grease-plugins-directory "/nonexistent/grease-plugins")
+        (grease--plugins-loaded nil)
+        (grease-test--plugin-log nil))
+    (grease--apply-plugin-config)
+    (should (null grease-test--plugin-log))
+    (should grease--plugins-loaded)))
+
+(ert-deftest grease-test-plugins-relative-directory-resolves-to-source ()
+  "A relative `grease-plugins-directory' resolves against grease.el's dir."
+  (grease-test-with-temp-dir
+    (let ((plugins-dir (expand-file-name "plugins-rel" temp-dir)))
+      (make-directory plugins-dir)
+      (grease-test--write-plugin plugins-dir "x.el"
+                                 '(push "x" grease-test--plugin-log))
+      (let ((grease--source-directory temp-dir)
+            (grease-plugins-directory "plugins-rel")
+            (grease--plugins-loaded nil)
+            (grease-test--plugin-log nil))
+        (grease--apply-plugin-config)
+        (should (equal grease-test--plugin-log '("x")))))))
+
 (provide 'grease-test)
 ;;; grease-test.el ends here
