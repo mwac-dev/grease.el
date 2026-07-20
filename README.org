@@ -34,6 +34,69 @@ Clone this repo somewhere on your load path (e.g. =~/.config/doom/lisp/=):
 (require 'grease)
 #+end_src
 
+* Plugin System
+
+Grease includes a lightweight plugin loader.  Place =.el= files in the
+=plugins/= directory adjacent to =grease.el=, and enable auto-loading
+/by setting =grease-load-plugins= to =t= before loading Grease./
+
+#+begin_src emacs-lisp
+(setq grease-load-plugins t)  ;; enable plugin auto-loading
+(require 'grease)
+#+end_src
+
+Every regular file matching =*.el= in the directory (except dotfiles and
+Emacs lockfiles like =.#foo.el=) is loaded with =load=, isolated via
+=condition-case= — a failing plugin is reported with =display-warning=
+and does not prevent the remaining plugins from loading.
+
+Plugins are loaded /after/ =(provide 'grease)=, so all Grease
+functions, hooks, and variables are available to plugin code.
+
+** Custom plugin directory
+
+Override the default =plugins/= directory by setting
+=grease-plugins-directory= /before/ loading Grease:
+
+#+begin_src emacs-lisp
+(setq grease-plugins-directory "~/.emacs.d/grease-plugins/")
+(setq grease-load-plugins t)
+(require 'grease)
+#+end_src
+
+A relative path is resolved against =grease.el='s own location.
+
+** Writing a plugin
+
+Plugins are ordinary Emacs Lisp files that can use =add-hook= on any
+Grease hook, =advice-add= on Grease functions, or read buffer-local
+Grease variables like =grease--root-dir=.
+
+The recommended skeleton:
+
+#+begin_src emacs-lisp
+;;; my-grease-plugin.el --- Describe it here  -*- lexical-binding: t; -*-
+
+;;; Commentary:
+;; What this plugin does and how it interacts with Grease.
+
+;;; Code:
+
+(defun my-grease-plugin--on-visit (payload)
+  "React when Grease visits a file or directory."
+  (let ((path (plist-get payload :path))
+        (type (plist-get payload :type)))
+    (when (eq type 'file)
+      (message "Grease visited: %s" path))))
+
+;; Register with Grease hooks — plugins load after (provide 'grease),
+;; so all Grease symbols are available.
+(add-hook 'grease-visit-hook #'my-grease-plugin--on-visit)
+
+(provide 'my-grease-plugin)
+;;; my-grease-plugin.el ends here
+#+end_src
+
 * Configuration
 
 ** Minimal Config

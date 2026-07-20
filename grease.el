@@ -141,6 +141,89 @@ the same local/remote filesystem adapter."
   :type 'boolean
   :group 'grease)
 
+;;;; Plugin Loading
+
+(defconst grease--source-directory
+  (file-name-directory
+   (or load-file-name buffer-file-name (locate-library "grease") ""))
+  "Directory containing grease.el, captured at load time.")
+
+(defun grease--default-plugins-directory ()
+  "Return the default plugins directory: plugins/ adjacent to grease.el."
+  (expand-file-name "plugins" grease--source-directory))
+
+(defcustom grease-load-plugins nil
+  "When non-nil, load every plugin from `grease-plugins-directory'.
+Plugins are ordinary Emacs Lisp files loaded with `load' after
+Grease finishes loading itself (`(provide 'grease)' has run).
+This executes arbitrary code; enable it only for plugin directories
+you trust.
+
+Plugins are loaded /after/ (provide 'grease), so all Grease functions,
+hooks, and variables are available to plugin code.
+
+Set this before loading `grease.el', or set it and call
+`grease--apply-plugin-config' manually."
+  :type 'boolean
+  :group 'grease)
+
+(defcustom grease-plugins-directory (grease--default-plugins-directory)
+  "Directory searched for Grease plugin files (*.el).
+A relative value is resolved against grease.el's own directory."
+  :type 'directory
+  :group 'grease)
+
+(defvar grease--plugins-loaded nil
+  "Non-nil once plugins have been loaded in this session.")
+
+(defun grease--plugin-files ()
+  "Return top-level plugin files in `grease-plugins-directory', sorted.
+Dot-prefixed files are excluded, including Emacs lockfiles (.#foo.el).
+Directories ending in \".el\" are also excluded (only regular files)."
+  (let ((dir (expand-file-name grease-plugins-directory
+                               grease--source-directory)))
+    (when (file-directory-p dir)
+      (cl-remove-if-not #'file-regular-p
+                        (directory-files dir t "\\`[^.#].*\\.el\\'")))))
+
+(defun grease--apply-plugin-config (&optional force)
+  "Load every plugin file from `grease-plugins-directory'.
+
+Plugins are ordinary Emacs Lisp files loaded with `load'.  Each file
+is isolated with `condition-case'; a failing plugin is reported via
+`display-warning' and does not prevent the remaining plugins from
+loading.
+
+This function runs only once per session, after `(provide 'grease)'
+has executed, so plugins have full access to all Grease symbols.
+Call with FORCE non-nil to reload all plugins (e.g. after
+development changes).
+
+Only regular files matching `*.el' are loaded.  Dot-prefixed files,
+Emacs lockfiles (.#foo.el), and subdirectories are silently skipped."
+  (unless (featurep 'grease)
+    (error "Cannot load Grease plugins: Grease itself is not loaded"))
+  (when (or force (not grease--plugins-loaded))
+    (setq grease--plugins-loaded t)
+    (let ((loaded 0) (failed 0))
+      (dolist (file (grease--plugin-files))
+        (condition-case err
+            (progn
+              (load file nil 'nomessage)
+              (cl-incf loaded))
+          (error
+           (cl-incf failed)
+           (display-warning
+            'grease
+            (format "Plugin %s failed to load: %s"
+                    (file-name-nondirectory file)
+                    (error-message-string err))
+            :error))))
+      (when (or (> loaded 0) (> failed 0))
+        (message "Grease: loaded %d plugin%s%s"
+                 loaded (if (= loaded 1) "" "s")
+                 (if (> failed 0) (format " (%d failed)" failed) ""))))))
+
 ;;;; Sorting Configuration
 
 (defvar grease-sort-method 'type
@@ -3530,4 +3613,8 @@ If already open, quit (saving position). Otherwise open project root."
 (grease--apply-custom-face-colors)
 
 (provide 'grease)
+
+;; Load user plugins when enabled (see `grease-load-plugins').
+(when grease-load-plugins
+  (grease--apply-plugin-config))
 ;;; grease.el ends here
