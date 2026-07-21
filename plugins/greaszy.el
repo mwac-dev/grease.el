@@ -192,10 +192,11 @@ text properties, or nil if LINE can't be parsed."
 
 (defun greaszy-consult-builder (input)
   "Build command line for `zoxide query -ls' from INPUT.
-Returns a command list or nil."
+Returns a command list or nil.
+Splits INPUT on whitespace for multi-keyword matching."
   (if (or (not input) (string-empty-p input))
       (list greaszy-executable "query" "-ls")
-    (list greaszy-executable "query" "-ls" input)))
+    (apply #'list greaszy-executable "query" "-ls" (split-string input))))
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; ── Consult async pipeline ─────────────────────────────────────────────────
