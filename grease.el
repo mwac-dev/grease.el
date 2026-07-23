@@ -980,7 +980,7 @@ single backspace does not remove its display."
   (when (and grease-show-symlink-targets (< name-start name-end))
     (when-let ((data (grease--symlink-display-data id full-path)))
       (let* ((suffix (propertize
-                      (concat "  " (plist-get data :resolved))
+                      (concat " 󰔰 " (plist-get data :resolved))
                       'face (plist-get data :face)))
              (overlay (make-overlay name-start name-end)))
         ;; Prevent Emacs from drawing point at the far end of virtual text.
